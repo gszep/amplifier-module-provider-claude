@@ -1,2 +1,0 @@
-[amplifier.modules]
-provider-anthropic = amplifier_mod_provider_anthropic:mount
