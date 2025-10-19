@@ -19,7 +19,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
 ## Purpose
 
-Provides access to Anthropic's Claude models (Claude 3.5 Sonnet, Opus, Haiku, etc.) as an LLM provider for Amplifier.
+Provides access to Anthropic's Claude models (Claude 4 series: Sonnet, Opus, Haiku) as an LLM provider for Amplifier.
 
 ## Contract
 
@@ -29,10 +29,9 @@ Provides access to Anthropic's Claude models (Claude 3.5 Sonnet, Opus, Haiku, et
 
 ## Supported Models
 
-- `claude-sonnet-4.5` - Latest Sonnet (recommended)
-- `claude-3-5-sonnet-20241022` - Claude 3.5 Sonnet
-- `claude-3-opus-20240229` - Claude 3 Opus
-- `claude-3-haiku-20240307` - Claude 3 Haiku
+- `claude-sonnet-4-5` - Claude Sonnet 4.5 (recommended, default)
+- `claude-opus-4` - Claude Opus 4 (most capable)
+- `claude-haiku-4-5` - Claude Haiku 4.5 (fastest, cheapest)
 
 ## Configuration
 
@@ -41,7 +40,7 @@ Provides access to Anthropic's Claude models (Claude 3.5 Sonnet, Opus, Haiku, et
 module = "provider-anthropic"
 name = "anthropic"
 config = {
-    model = "claude-sonnet-4.5",
+    default_model = "claude-sonnet-4-5",
     max_tokens = 8192,
     temperature = 1.0
 }
@@ -59,7 +58,7 @@ export ANTHROPIC_API_KEY="your-api-key-here"
 # In amplifier configuration
 [provider]
 name = "anthropic"
-model = "claude-sonnet-4.5"
+default_model = "claude-sonnet-4-5"
 ```
 
 ## Features

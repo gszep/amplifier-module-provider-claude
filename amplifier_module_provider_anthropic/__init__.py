@@ -73,7 +73,7 @@ class AnthropicProvider:
         self.client = AsyncAnthropic(api_key=api_key)
         self.config = config or {}
         self.coordinator = coordinator
-        self.default_model = self.config.get("default_model", "claude-3-5-sonnet-20241022")
+        self.default_model = self.config.get("default_model", "claude-sonnet-4-5")
         self.max_tokens = self.config.get("max_tokens", 4096)
         self.temperature = self.config.get("temperature", 0.7)
         self.priority = self.config.get("priority", 100)  # Store priority for selection
