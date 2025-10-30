@@ -573,38 +573,56 @@ class AnthropicProvider:
             i += 1
 
     def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Convert messages to Anthropic format."""
-        anthropic_messages = []
+        """Convert messages to Anthropic format.
 
-        for msg in messages:
+        CRITICAL: Anthropic requires ALL tool_result blocks from one assistant's tool_use
+        to be batched into a SINGLE user message with multiple tool_result blocks in the
+        content array. We cannot send separate user messages for each tool result.
+
+        This method batches consecutive tool messages into one user message.
+        """
+        anthropic_messages = []
+        i = 0
+
+        while i < len(messages):
+            msg = messages[i]
             role = msg.get("role")
             content = msg.get("content", "")
 
             # Skip system messages (handled separately)
             if role == "system":
+                i += 1
                 continue
 
-            # Convert role names
+            # Batch consecutive tool messages into ONE user message
             if role == "tool":
-                # Tool results in Anthropic format
-                tool_use_id = msg.get("tool_call_id")
-                if not tool_use_id:
-                    logger.warning(f"Tool result missing tool_call_id: {msg}")
-                    tool_use_id = "unknown"  # Fallback, but will likely fail
+                # Collect all consecutive tool results
+                tool_results = []
+                while i < len(messages) and messages[i].get("role") == "tool":
+                    tool_msg = messages[i]
+                    tool_use_id = tool_msg.get("tool_call_id")
+                    if not tool_use_id:
+                        logger.warning(f"Tool result missing tool_call_id: {tool_msg}")
+                        tool_use_id = "unknown"  # Fallback
 
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": tool_msg.get("content", ""),
+                        }
+                    )
+                    i += 1
+
+                # Add ONE user message with ALL tool results
                 anthropic_messages.append(
                     {
                         "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": tool_use_id,
-                                "content": content,
-                            }
-                        ],
+                        "content": tool_results,  # Array of tool_result blocks
                     }
                 )
-            elif role == "assistant":
+                continue  # i already advanced in while loop
+            if role == "assistant":
                 # Assistant messages - check for tool calls or thinking blocks
                 if "tool_calls" in msg and msg["tool_calls"]:
                     # Assistant message with tool calls
@@ -640,13 +658,16 @@ class AnthropicProvider:
                 else:
                     # Regular assistant message
                     anthropic_messages.append({"role": "assistant", "content": content})
+                i += 1
             elif role == "developer":
                 # Developer messages -> XML-wrapped user messages (context files)
                 wrapped = f"<context_file>\n{content}\n</context_file>"
                 anthropic_messages.append({"role": "user", "content": wrapped})
+                i += 1
             else:
                 # User messages
                 anthropic_messages.append({"role": "user", "content": content})
+                i += 1
 
         return anthropic_messages
 
