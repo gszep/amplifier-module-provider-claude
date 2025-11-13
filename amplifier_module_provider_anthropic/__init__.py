@@ -181,12 +181,10 @@ class AnthropicProvider:
             await self.coordinator.hooks.emit(
                 "llm:request",
                 {
-                    "data": {
-                        "provider": "anthropic",
-                        "model": params["model"],
-                        "message_count": len(anthropic_messages),
-                        "thinking_enabled": params.get("thinking") is not None,
-                    }
+                    "provider": "anthropic",
+                    "model": params["model"],
+                    "message_count": len(anthropic_messages),
+                    "thinking_enabled": params.get("thinking") is not None,
                 },
             )
 
@@ -196,16 +194,14 @@ class AnthropicProvider:
                     "llm:request:debug",
                     {
                         "lvl": "DEBUG",
-                        "data": {
-                            "provider": "anthropic",
-                            "request": {
-                                "model": params["model"],
-                                "messages": anthropic_messages,
-                                "system": system,
-                                "max_tokens": params["max_tokens"],
-                                "temperature": params["temperature"],
-                                "thinking": params.get("thinking"),
-                            },
+                        "provider": "anthropic",
+                        "request": {
+                            "model": params["model"],
+                            "messages": anthropic_messages,
+                            "system": system,
+                            "max_tokens": params["max_tokens"],
+                            "temperature": params["temperature"],
+                            "thinking": params.get("thinking"),
                         },
                     },
                 )
@@ -216,10 +212,8 @@ class AnthropicProvider:
                 "llm:request:raw",
                 {
                     "lvl": "DEBUG",
-                    "data": {
-                        "provider": "anthropic",
-                        "params": params,  # Complete params dict as-is
-                    },
+                    "provider": "anthropic",
+                    "params": params,  # Complete params dict as-is
                 },
             )
 
@@ -233,10 +227,8 @@ class AnthropicProvider:
                     "llm:response:raw",
                     {
                         "lvl": "DEBUG",
-                        "data": {
-                            "provider": "anthropic",
-                            "response": response,  # Complete response object as-is
-                        },
+                        "provider": "anthropic",
+                        "response": response,  # Complete response object as-is
                     },
                 )
             elapsed_ms = int((time.time() - start_time) * 1000)
@@ -273,12 +265,13 @@ class AnthropicProvider:
                 await self.coordinator.hooks.emit(
                     "llm:response",
                     {
-                        "data": {
-                            "provider": "anthropic",
-                            "model": params["model"],
-                            "usage": {"input": response.usage.input_tokens, "output": response.usage.output_tokens},
-                            "has_thinking": bool(thinking_text),
+                        "provider": "anthropic",
+                        "model": params["model"],
+                        "usage": {
+                            "input": response.usage.input_tokens,
+                            "output": response.usage.output_tokens,
                         },
+                        "has_thinking": bool(thinking_text),
                         "status": "ok",
                         "duration_ms": elapsed_ms,
                     },
@@ -290,18 +283,14 @@ class AnthropicProvider:
                         "llm:response:debug",
                         {
                             "lvl": "DEBUG",
-                            "data": {
-                                "provider": "anthropic",
-                                "response": {
-                                    "content": content,
-                                    "thinking": thinking_text[:500] + "..."
-                                    if len(thinking_text) > 500
-                                    else thinking_text,
-                                    "tool_calls": [{"tool": tc.tool, "id": tc.id} for tc in tool_calls]
-                                    if tool_calls
-                                    else [],
-                                    "stop_reason": response.stop_reason,
-                                },
+                            "provider": "anthropic",
+                            "response": {
+                                "content": content,
+                                "thinking": thinking_text[:500] + "..." if len(thinking_text) > 500 else thinking_text,
+                                "tool_calls": [{"tool": tc.tool, "id": tc.id} for tc in tool_calls]
+                                if tool_calls
+                                else [],
+                                "stop_reason": response.stop_reason,
                             },
                             "status": "ok",
                             "duration_ms": elapsed_ms,
@@ -410,12 +399,10 @@ class AnthropicProvider:
             await self.coordinator.hooks.emit(
                 "llm:request",
                 {
-                    "data": {
-                        "provider": "anthropic",
-                        "model": params["model"],
-                        "message_count": len(params["messages"]),
-                        "has_system": bool(system),
-                    }
+                    "provider": "anthropic",
+                    "model": params["model"],
+                    "message_count": len(params["messages"]),
+                    "has_system": bool(system),
                 },
             )
 
@@ -425,15 +412,13 @@ class AnthropicProvider:
                     "llm:request:debug",
                     {
                         "lvl": "DEBUG",
-                        "data": {
-                            "provider": "anthropic",
-                            "request": {
-                                "model": params["model"],
-                                "messages": params["messages"],
-                                "system": system,
-                                "max_tokens": params["max_tokens"],
-                                "temperature": params["temperature"],
-                            },
+                        "provider": "anthropic",
+                        "request": {
+                            "model": params["model"],
+                            "messages": params["messages"],
+                            "system": system,
+                            "max_tokens": params["max_tokens"],
+                            "temperature": params["temperature"],
                         },
                     },
                 )
@@ -454,10 +439,11 @@ class AnthropicProvider:
                 await self.coordinator.hooks.emit(
                     "llm:response",
                     {
-                        "data": {
-                            "provider": "anthropic",
-                            "model": params["model"],
-                            "usage": {"input": response.usage.input_tokens, "output": response.usage.output_tokens},
+                        "provider": "anthropic",
+                        "model": params["model"],
+                        "usage": {
+                            "input": response.usage.input_tokens,
+                            "output": response.usage.output_tokens,
                         },
                         "status": "ok",
                         "duration_ms": elapsed_ms,
@@ -471,12 +457,10 @@ class AnthropicProvider:
                         "llm:response:debug",
                         {
                             "lvl": "DEBUG",
-                            "data": {
-                                "provider": "anthropic",
-                                "response": {
-                                    "content_preview": content_preview,
-                                    "stop_reason": response.stop_reason,
-                                },
+                            "provider": "anthropic",
+                            "response": {
+                                "content_preview": content_preview,
+                                "stop_reason": response.stop_reason,
                             },
                             "status": "ok",
                             "duration_ms": elapsed_ms,
