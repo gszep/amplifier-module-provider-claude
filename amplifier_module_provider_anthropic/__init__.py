@@ -26,6 +26,13 @@ from anthropic import AsyncAnthropic
 logger = logging.getLogger(__name__)
 
 
+class AnthropicChatResponse(ChatResponse):
+    """ChatResponse with additional fields for streaming UI compatibility."""
+
+    content_blocks: list[TextContent | ThinkingContent | ToolCallContent] | None = None
+    text: str | None = None
+
+
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
     """
     Mount the Anthropic provider.
@@ -92,7 +99,35 @@ class AnthropicProvider:
         self.priority = self.config.get("priority", 100)  # Store priority for selection
         self.debug = self.config.get("debug", False)  # Enable full request/response logging
         self.raw_debug = self.config.get("raw_debug", False)  # Enable ultra-verbose raw API I/O logging
+        self.debug_truncate_length = self.config.get("debug_truncate_length", 180)  # Max string length in debug logs
         self.timeout = self.config.get("timeout", 300.0)  # API timeout in seconds (default 5 minutes)
+
+    def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
+        """Recursively truncate string values in nested structures.
+
+        Preserves structure, only truncates leaf string values longer than max_length.
+        Uses self.debug_truncate_length if max_length not specified.
+
+        Args:
+            obj: Any JSON-serializable structure (dict, list, primitives)
+            max_length: Maximum string length (defaults to self.debug_truncate_length)
+
+        Returns:
+            Structure with truncated string values
+        """
+        if max_length is None:
+            max_length = self.debug_truncate_length
+
+        if isinstance(obj, str):
+            if len(obj) > max_length:
+                return obj[:max_length] + f"... (truncated {len(obj) - max_length} chars)"
+            return obj
+        elif isinstance(obj, dict):
+            return {k: self._truncate_values(v, max_length) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._truncate_values(item, max_length) for item in obj]
+        else:
+            return obj  # Numbers, booleans, None pass through unchanged
 
     def _find_missing_tool_results(self, messages: list[Message]) -> list[tuple[str, str, dict]]:
         """Find tool calls without matching results.
@@ -247,9 +282,46 @@ class AnthropicProvider:
         # Add tools if provided
         if request.tools:
             params["tools"] = self._convert_tools_from_request(request.tools)
+            # Add tool_choice if specified
+            if tool_choice := kwargs.get("tool_choice"):
+                params["tool_choice"] = tool_choice
+
+        # Enable extended thinking if requested (equivalent to OpenAI's reasoning)
+        thinking_enabled = bool(kwargs.get("extended_thinking"))
+        thinking_budget = None
+        if thinking_enabled:
+            budget_tokens = kwargs.get("thinking_budget_tokens") or self.config.get("thinking_budget_tokens") or 10000
+            buffer_tokens = kwargs.get("thinking_budget_buffer") or self.config.get("thinking_budget_buffer", 4096)
+
+            thinking_budget = budget_tokens
+            params["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": budget_tokens,
+            }
+
+            # CRITICAL: Anthropic requires temperature=1.0 when thinking is enabled
+            params["temperature"] = 1.0
+
+            # Ensure max_tokens accommodates thinking budget + response
+            target_tokens = budget_tokens + buffer_tokens
+            if params.get("max_tokens"):
+                params["max_tokens"] = max(params["max_tokens"], target_tokens)
+            else:
+                params["max_tokens"] = target_tokens
+
+            logger.info(
+                "[PROVIDER] Extended thinking enabled (budget=%s, buffer=%s, temperature=1.0, max_tokens=%s)",
+                thinking_budget,
+                buffer_tokens,
+                params["max_tokens"],
+            )
+
+        # Add stop_sequences if specified
+        if stop_sequences := kwargs.get("stop_sequences"):
+            params["stop_sequences"] = stop_sequences
 
         logger.info(
-            f"[PROVIDER] Anthropic API call - model: {params['model']}, messages: {len(params['messages'])}, system: {bool(system)}, tools: {len(params.get('tools', []))}"
+            f"[PROVIDER] Anthropic API call - model: {params['model']}, messages: {len(params['messages'])}, system: {bool(system)}, tools: {len(params.get('tools', []))}, thinking: {thinking_enabled}"
         )
 
         # Emit llm:request event
@@ -262,24 +334,30 @@ class AnthropicProvider:
                     "model": params["model"],
                     "message_count": len(params["messages"]),
                     "has_system": bool(system),
+                    "thinking_enabled": thinking_enabled,
+                    "thinking_budget": thinking_budget,
                 },
             )
 
-            # DEBUG level: Full request payload (if debug enabled)
+            # DEBUG level: Full request payload with truncated values (if debug enabled)
             if self.debug:
                 await self.coordinator.hooks.emit(
                     "llm:request:debug",
                     {
                         "lvl": "DEBUG",
                         "provider": "anthropic",
-                        "request": {
-                            "model": params["model"],
-                            "messages": params["messages"],
-                            "system": system,
-                            "max_tokens": params["max_tokens"],
-                            "temperature": params["temperature"],
-                            "tools": params.get("tools"),
-                        },
+                        "request": self._truncate_values(params),
+                    },
+                )
+
+            # RAW level: Complete params dict as sent to Anthropic API (if debug AND raw_debug enabled)
+            if self.debug and self.raw_debug:
+                await self.coordinator.hooks.emit(
+                    "llm:request:raw",
+                    {
+                        "lvl": "DEBUG",
+                        "provider": "anthropic",
+                        "params": params,  # Complete untruncated params
                     },
                 )
 
@@ -310,20 +388,28 @@ class AnthropicProvider:
                     },
                 )
 
-                # DEBUG level: Full response (if debug enabled)
+                # DEBUG level: Full response with truncated values (if debug enabled)
                 if self.debug:
-                    content_preview = str(response.content)[:500] if response.content else ""
+                    response_dict = response.model_dump()  # Pydantic model → dict
                     await self.coordinator.hooks.emit(
                         "llm:response:debug",
                         {
                             "lvl": "DEBUG",
                             "provider": "anthropic",
-                            "response": {
-                                "content_preview": content_preview,
-                                "stop_reason": response.stop_reason,
-                            },
+                            "response": self._truncate_values(response_dict),
                             "status": "ok",
                             "duration_ms": elapsed_ms,
+                        },
+                    )
+
+                # RAW level: Complete response object from Anthropic API (if debug AND raw_debug enabled)
+                if self.debug and self.raw_debug:
+                    await self.coordinator.hooks.emit(
+                        "llm:response:raw",
+                        {
+                            "lvl": "DEBUG",
+                            "provider": "anthropic",
+                            "response": response.model_dump(),  # Complete untruncated response
                         },
                     )
 
@@ -505,7 +591,7 @@ class AnthropicProvider:
             response: Anthropic API response
 
         Returns:
-            ChatResponse with content blocks
+            AnthropicChatResponse with content blocks and streaming-compatible fields
         """
         from amplifier_core.message_models import TextBlock
         from amplifier_core.message_models import ThinkingBlock
@@ -515,17 +601,28 @@ class AnthropicProvider:
 
         content_blocks = []
         tool_calls = []
+        event_blocks: list[TextContent | ThinkingContent | ToolCallContent] = []
+        text_accumulator: list[str] = []
 
         for block in response.content:
             if block.type == "text":
                 content_blocks.append(TextBlock(text=block.text))
+                text_accumulator.append(block.text)
+                event_blocks.append(TextContent(text=block.text))
             elif block.type == "thinking":
                 content_blocks.append(
-                    ThinkingBlock(thinking=block.thinking, signature=getattr(block, "signature", None))
+                    ThinkingBlock(
+                        thinking=block.thinking,
+                        signature=getattr(block, "signature", None),
+                        visibility="internal",
+                    )
                 )
+                event_blocks.append(ThinkingContent(text=block.thinking))
+                # NOTE: Do NOT add thinking to text_accumulator - it's internal process, not response content
             elif block.type == "tool_use":
                 content_blocks.append(ToolCallBlock(id=block.id, name=block.name, input=block.input))
                 tool_calls.append(ToolCall(id=block.id, name=block.name, arguments=block.input))
+                event_blocks.append(ToolCallContent(id=block.id, name=block.name, arguments=block.input))
 
         usage = Usage(
             input_tokens=response.usage.input_tokens,
@@ -533,9 +630,13 @@ class AnthropicProvider:
             total_tokens=response.usage.input_tokens + response.usage.output_tokens,
         )
 
-        return ChatResponse(
+        combined_text = "\n\n".join(text_accumulator).strip()
+
+        return AnthropicChatResponse(
             content=content_blocks,
             tool_calls=tool_calls if tool_calls else None,
             usage=usage,
             finish_reason=response.stop_reason,
+            content_blocks=event_blocks if event_blocks else None,
+            text=combined_text or None,
         )
