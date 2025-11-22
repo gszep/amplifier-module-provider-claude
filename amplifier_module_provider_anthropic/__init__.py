@@ -118,16 +118,18 @@ class AnthropicProvider:
         if max_length is None:
             max_length = self.debug_truncate_length
 
+        # Type guard: max_length is guaranteed to be int after this point
+        assert max_length is not None, "max_length should never be None after initialization"
+
         if isinstance(obj, str):
             if len(obj) > max_length:
                 return obj[:max_length] + f"... (truncated {len(obj) - max_length} chars)"
             return obj
-        elif isinstance(obj, dict):
+        if isinstance(obj, dict):
             return {k: self._truncate_values(v, max_length) for k, v in obj.items()}
-        elif isinstance(obj, list):
+        if isinstance(obj, list):
             return [self._truncate_values(item, max_length) for item in obj]
-        else:
-            return obj  # Numbers, booleans, None pass through unchanged
+        return obj  # Numbers, booleans, None pass through unchanged
 
     def _find_missing_tool_results(self, messages: list[Message]) -> list[tuple[str, str, dict]]:
         """Find tool calls without matching results.
