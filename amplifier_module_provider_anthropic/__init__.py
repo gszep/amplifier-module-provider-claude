@@ -570,7 +570,16 @@ class AnthropicProvider:
 
                     # Add text content if present
                     if content:
-                        content_blocks.append({"type": "text", "text": content})
+                        if isinstance(content, list):
+                            # Content is a list of blocks - extract text blocks only
+                            for block in content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    content_blocks.append({"type": "text", "text": block.get("text", "")})
+                                elif hasattr(block, "type") and block.type == "text":
+                                    content_blocks.append({"type": "text", "text": getattr(block, "text", "")})
+                        else:
+                            # Content is a simple string
+                            content_blocks.append({"type": "text", "text": content})
 
                     # Add tool_use blocks
                     for tc in msg["tool_calls"]:
@@ -590,7 +599,16 @@ class AnthropicProvider:
                     cleaned_thinking = self._clean_content_block(msg["thinking_block"])
                     content_blocks = [cleaned_thinking]
                     if content:
-                        content_blocks.append({"type": "text", "text": content})
+                        if isinstance(content, list):
+                            # Content is a list of blocks - extract text blocks only
+                            for block in content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    content_blocks.append({"type": "text", "text": block.get("text", "")})
+                                elif hasattr(block, "type") and block.type == "text":
+                                    content_blocks.append({"type": "text", "text": getattr(block, "text", "")})
+                        else:
+                            # Content is a simple string
+                            content_blocks.append({"type": "text", "text": content})
                     anthropic_messages.append({"role": "assistant", "content": content_blocks})
                 else:
                     # Regular assistant message - may have structured content blocks
