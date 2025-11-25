@@ -13,7 +13,9 @@ import time
 from typing import Any
 from typing import Optional
 
+from amplifier_core import ModelInfo
 from amplifier_core import ModuleCoordinator
+from amplifier_core import ProviderInfo
 from amplifier_core.content_models import TextContent
 from amplifier_core.content_models import ThinkingContent
 from amplifier_core.content_models import ToolCallContent
@@ -106,9 +108,7 @@ class AnthropicProvider:
         default_headers = None
         if beta_headers_config:
             # Normalize to list (supports string or list of strings)
-            beta_headers_list = (
-                [beta_headers_config] if isinstance(beta_headers_config, str) else beta_headers_config
-            )
+            beta_headers_list = [beta_headers_config] if isinstance(beta_headers_config, str) else beta_headers_config
             # Build anthropic-beta header value (comma-separated)
             beta_header_value = ",".join(beta_headers_list)
             default_headers = {"anthropic-beta": beta_header_value}
@@ -116,6 +116,71 @@ class AnthropicProvider:
 
         # Initialize client with optional beta headers
         self.client = AsyncAnthropic(api_key=api_key, default_headers=default_headers)
+
+    def get_info(self) -> ProviderInfo:
+        """Get provider metadata."""
+        return ProviderInfo(
+            id="anthropic",
+            display_name="Anthropic",
+            credential_env_vars=["ANTHROPIC_API_KEY"],
+            capabilities=["streaming", "tools", "vision", "thinking", "batch"],
+            defaults={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 4096,
+                "temperature": 0.7,
+                "timeout": 300.0,
+            },
+        )
+
+    async def list_models(self) -> list[ModelInfo]:
+        """
+        List available Claude models.
+
+        Returns hardcoded list of known Claude models since Anthropic doesn't
+        provide a model listing API.
+        """
+        return [
+            ModelInfo(
+                id="claude-opus-4-5",
+                display_name="Claude Opus 4.5",
+                context_window=200000,
+                max_output_tokens=32000,
+                capabilities=["tools", "vision", "thinking", "streaming", "json_mode"],
+                defaults={"temperature": 0.7, "max_tokens": 4096},
+            ),
+            ModelInfo(
+                id="claude-sonnet-4-5",
+                display_name="Claude Sonnet 4.5",
+                context_window=200000,
+                max_output_tokens=16000,
+                capabilities=["tools", "vision", "thinking", "streaming", "json_mode"],
+                defaults={"temperature": 0.7, "max_tokens": 4096},
+            ),
+            ModelInfo(
+                id="claude-sonnet-4-0",
+                display_name="Claude Sonnet 4.0",
+                context_window=200000,
+                max_output_tokens=16000,
+                capabilities=["tools", "vision", "streaming", "json_mode"],
+                defaults={"temperature": 0.7, "max_tokens": 4096},
+            ),
+            ModelInfo(
+                id="claude-haiku-3-5",
+                display_name="Claude Haiku 3.5",
+                context_window=200000,
+                max_output_tokens=8192,
+                capabilities=["tools", "vision", "streaming", "json_mode", "fast"],
+                defaults={"temperature": 0.7, "max_tokens": 4096},
+            ),
+            ModelInfo(
+                id="claude-3-opus-20240229",
+                display_name="Claude 3 Opus",
+                context_window=200000,
+                max_output_tokens=4096,
+                capabilities=["tools", "vision", "streaming"],
+                defaults={"temperature": 0.7, "max_tokens": 4096},
+            ),
+        ]
 
     def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
         """Recursively truncate string values in nested structures.
