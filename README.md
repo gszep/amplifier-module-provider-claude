@@ -71,6 +71,58 @@ providers:
       default_model: claude-sonnet-4-5
 ```
 
+## Beta Headers
+
+Anthropic provides experimental features through beta headers. Enable these features by adding the `beta_headers` configuration field.
+
+### Configuration
+
+**Single beta header:**
+```yaml
+providers:
+  - module: provider-anthropic
+    config:
+      default_model: claude-sonnet-4-5
+      beta_headers: "context-1m-2025-08-07"  # Enable 1M token context window
+```
+
+**Multiple beta headers:**
+```yaml
+providers:
+  - module: provider-anthropic
+    config:
+      default_model: claude-sonnet-4-5
+      beta_headers:
+        - "context-1m-2025-08-07"
+        - "future-feature-header"
+```
+
+### 1M Token Context Window
+
+Claude Sonnet 4.5 supports a 1M token context window when the `context-1m-2025-08-07` beta header is enabled:
+
+```yaml
+providers:
+  - module: provider-anthropic
+    config:
+      default_model: claude-sonnet-4-5
+      beta_headers: "context-1m-2025-08-07"
+      max_tokens: 8192  # Output tokens remain separate from context window
+```
+
+With this configuration:
+- **Context window**: Up to 1M tokens of input (messages, tools, system prompt)
+- **Output tokens**: Controlled by `max_tokens` (separate from context window)
+- **Use case**: Process large codebases, extensive documentation, or long conversation histories
+
+### Notes
+
+- Beta features are experimental and subject to change
+- Check [Anthropic's documentation](https://docs.anthropic.com) for available beta headers
+- Beta headers are optional - existing configurations work unchanged
+- Invalid beta headers will cause API errors (fail fast)
+- Beta header usage is logged at initialization for observability
+
 ## Environment Variables
 
 ```bash

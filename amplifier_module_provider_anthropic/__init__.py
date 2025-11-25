@@ -90,7 +90,6 @@ class AnthropicProvider:
             config: Additional configuration
             coordinator: Module coordinator for event emission
         """
-        self.client = AsyncAnthropic(api_key=api_key)
         self.config = config or {}
         self.coordinator = coordinator
         self.default_model = self.config.get("default_model", "claude-sonnet-4-5")
@@ -101,6 +100,22 @@ class AnthropicProvider:
         self.raw_debug = self.config.get("raw_debug", False)  # Enable ultra-verbose raw API I/O logging
         self.debug_truncate_length = self.config.get("debug_truncate_length", 180)  # Max string length in debug logs
         self.timeout = self.config.get("timeout", 300.0)  # API timeout in seconds (default 5 minutes)
+
+        # Beta headers support for enabling experimental features
+        beta_headers_config = self.config.get("beta_headers")
+        default_headers = None
+        if beta_headers_config:
+            # Normalize to list (supports string or list of strings)
+            beta_headers_list = (
+                [beta_headers_config] if isinstance(beta_headers_config, str) else beta_headers_config
+            )
+            # Build anthropic-beta header value (comma-separated)
+            beta_header_value = ",".join(beta_headers_list)
+            default_headers = {"anthropic-beta": beta_header_value}
+            logger.info(f"[PROVIDER] Beta headers enabled: {beta_header_value}")
+
+        # Initialize client with optional beta headers
+        self.client = AsyncAnthropic(api_key=api_key, default_headers=default_headers)
 
     def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
         """Recursively truncate string values in nested structures.
