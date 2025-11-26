@@ -145,8 +145,9 @@ class AnthropicProvider:
                     field_type="boolean",
                     prompt="Enable 1M token context window? (sets beta header: context-1m-2025-08-07)",
                     required=False,
-                    default="false",
-                    show_when={"model": "claude-sonnet-4-5-20250929"},
+                    default="true",
+                    requires_model=True,  # Shown after model selection
+                    show_when={"default_model": "claude-sonnet-4-5-20250929"},
                 ),
             ],
         )
