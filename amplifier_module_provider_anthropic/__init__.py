@@ -13,6 +13,7 @@ import time
 from typing import Any
 from typing import Optional
 
+from amplifier_core import ConfigField
 from amplifier_core import ModelInfo
 from amplifier_core import ModuleCoordinator
 from amplifier_core import ProviderInfo
@@ -125,31 +126,41 @@ class AnthropicProvider:
             credential_env_vars=["ANTHROPIC_API_KEY"],
             capabilities=["streaming", "tools", "vision", "thinking", "batch"],
             defaults={
-                "model": "claude-sonnet-4-5",
+                "model": "claude-sonnet-4-5-20250929",
                 "max_tokens": 4096,
                 "temperature": 0.7,
                 "timeout": 300.0,
             },
+            config_fields=[
+                ConfigField(
+                    id="api_key",
+                    display_name="API Key",
+                    field_type="secret",
+                    prompt="Enter your Anthropic API key",
+                    env_var="ANTHROPIC_API_KEY",
+                ),
+                ConfigField(
+                    id="enable_1m_context",
+                    display_name="1M Context Window",
+                    field_type="boolean",
+                    prompt="Enable 1M token context window? (sets beta header: context-1m-2025-08-07)",
+                    required=False,
+                    default="false",
+                    show_when={"model": "claude-sonnet-4-5-20250929"},
+                ),
+            ],
         )
 
     async def list_models(self) -> list[ModelInfo]:
         """
         List available Claude models.
 
-        Returns hardcoded list of known Claude models since Anthropic doesn't
+        Returns hardcoded list of current Claude models since Anthropic doesn't
         provide a model listing API.
         """
         return [
             ModelInfo(
-                id="claude-opus-4-5",
-                display_name="Claude Opus 4.5",
-                context_window=200000,
-                max_output_tokens=32000,
-                capabilities=["tools", "vision", "thinking", "streaming", "json_mode"],
-                defaults={"temperature": 0.7, "max_tokens": 4096},
-            ),
-            ModelInfo(
-                id="claude-sonnet-4-5",
+                id="claude-sonnet-4-5-20250929",
                 display_name="Claude Sonnet 4.5",
                 context_window=200000,
                 max_output_tokens=16000,
@@ -157,27 +168,27 @@ class AnthropicProvider:
                 defaults={"temperature": 0.7, "max_tokens": 4096},
             ),
             ModelInfo(
-                id="claude-sonnet-4-0",
-                display_name="Claude Sonnet 4.0",
-                context_window=200000,
-                max_output_tokens=16000,
-                capabilities=["tools", "vision", "streaming", "json_mode"],
-                defaults={"temperature": 0.7, "max_tokens": 4096},
-            ),
-            ModelInfo(
-                id="claude-haiku-3-5",
-                display_name="Claude Haiku 3.5",
+                id="claude-haiku-4-5-20251001",
+                display_name="Claude Haiku 4.5",
                 context_window=200000,
                 max_output_tokens=8192,
                 capabilities=["tools", "vision", "streaming", "json_mode", "fast"],
                 defaults={"temperature": 0.7, "max_tokens": 4096},
             ),
             ModelInfo(
-                id="claude-3-opus-20240229",
-                display_name="Claude 3 Opus",
+                id="claude-opus-4-5-20251101",
+                display_name="Claude Opus 4.5",
                 context_window=200000,
-                max_output_tokens=4096,
-                capabilities=["tools", "vision", "streaming"],
+                max_output_tokens=32000,
+                capabilities=["tools", "vision", "thinking", "streaming", "json_mode"],
+                defaults={"temperature": 0.7, "max_tokens": 4096},
+            ),
+            ModelInfo(
+                id="claude-opus-4-1-20250805",
+                display_name="Claude Opus 4.1",
+                context_window=200000,
+                max_output_tokens=32000,
+                capabilities=["tools", "vision", "thinking", "streaming", "json_mode"],
                 defaults={"temperature": 0.7, "max_tokens": 4096},
             ),
         ]
