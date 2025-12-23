@@ -183,8 +183,7 @@ class AnthropicProvider:
                     required=False,
                     default="true",
                     requires_model=True,  # Shown after model selection
-                    # Note: Removed show_when constraint - 1M context works with Sonnet 4.x models
-                    # If enabled for unsupported model, API will return clear error (fail fast)
+                    show_when={"default_model": "contains:sonnet"},  # Only show for Sonnet models
                 ),
             ],
         )
