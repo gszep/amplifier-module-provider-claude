@@ -137,6 +137,12 @@ class AnthropicProvider:
         # Initialize client with optional beta headers and base_url
         self.client = AsyncAnthropic(api_key=api_key, base_url=base_url, default_headers=default_headers)
 
+        # Track tool call IDs that have been repaired with synthetic results.
+        # This prevents infinite loops when the same missing tool results are
+        # detected repeatedly across LLM iterations (since synthetic results
+        # are injected into request.messages but not persisted to message store).
+        self._repaired_tool_ids: set[str] = set()
+
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
         return ProviderInfo(
@@ -261,6 +267,9 @@ class AnthropicProvider:
         a corresponding tool result message. Returns missing pairs WITH their
         source message index so they can be inserted in the correct position.
 
+        Excludes tool call IDs that have already been repaired with synthetic
+        results to prevent infinite detection loops.
+
         Returns:
             List of (msg_index, call_id, tool_name, tool_arguments) tuples for unpaired calls.
             msg_index is the index of the assistant message containing the tool_use block.
@@ -279,10 +288,11 @@ class AnthropicProvider:
             elif msg.role == "tool" and hasattr(msg, "tool_call_id") and msg.tool_call_id:
                 tool_results.add(msg.tool_call_id)
 
+        # Exclude IDs that have already been repaired to prevent infinite loops
         return [
             (msg_idx, call_id, name, args)
             for call_id, (msg_idx, name, args) in tool_calls.items()
-            if call_id not in tool_results
+            if call_id not in tool_results and call_id not in self._repaired_tool_ids
         ]
 
     def _create_synthetic_result(self, call_id: str, tool_name: str) -> Message:
@@ -343,6 +353,8 @@ class AnthropicProvider:
                 synthetics = []
                 for call_id, tool_name in by_msg_idx[msg_idx]:
                     synthetics.append(self._create_synthetic_result(call_id, tool_name))
+                    # Track this ID so we don't detect it as missing again in future iterations
+                    self._repaired_tool_ids.add(call_id)
 
                 # Insert all synthetic results immediately after the assistant message
                 insert_pos = msg_idx + 1
