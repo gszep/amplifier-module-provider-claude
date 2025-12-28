@@ -106,6 +106,9 @@ class AnthropicProvider:
         self.raw_debug = self.config.get("raw_debug", False)  # Enable ultra-verbose raw API I/O logging
         self.debug_truncate_length = self.config.get("debug_truncate_length", 180)  # Max string length in debug logs
         self.timeout = self.config.get("timeout", 300.0)  # API timeout in seconds (default 5 minutes)
+        # Use streaming API by default to support large context windows (Anthropic requires streaming
+        # for operations that may take > 10 minutes, e.g. with 300k+ token contexts)
+        self.use_streaming = self.config.get("use_streaming", True)
 
         # Get base_url from config for custom endpoints (proxies, local APIs, etc.)
         base_url = self.config.get("base_url")
@@ -539,7 +542,14 @@ class AnthropicProvider:
 
         # Call Anthropic API
         try:
-            response = await asyncio.wait_for(self.client.messages.create(**params), timeout=self.timeout)
+            # Use streaming API to support large context windows (Anthropic requires streaming
+            # for operations that may take > 10 minutes)
+            if self.use_streaming:
+                async with asyncio.timeout(self.timeout):
+                    async with self.client.messages.stream(**params) as stream:
+                        response = await stream.get_final_message()
+            else:
+                response = await asyncio.wait_for(self.client.messages.create(**params), timeout=self.timeout)
             elapsed_ms = int((time.time() - start_time) * 1000)
 
             logger.info("[PROVIDER] Received response from Anthropic API")
