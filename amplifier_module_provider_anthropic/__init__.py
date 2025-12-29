@@ -87,16 +87,21 @@ class AnthropicProvider:
     api_label = "Anthropic"
 
     def __init__(
-        self, api_key: str, config: dict[str, Any] | None = None, coordinator: ModuleCoordinator | None = None
+        self, api_key: str | None = None, config: dict[str, Any] | None = None, coordinator: ModuleCoordinator | None = None
     ):
         """
         Initialize Anthropic provider.
 
+        The SDK client is created lazily on first use, allowing get_info()
+        to work without valid credentials.
+
         Args:
-            api_key: Anthropic API key
+            api_key: Anthropic API key (can be None for get_info() calls)
             config: Additional configuration
             coordinator: Module coordinator for event emission
         """
+        self._api_key = api_key
+        self._client: AsyncAnthropic | None = None  # Lazy init
         self.config = config or {}
         self.coordinator = coordinator
         self.default_model = self.config.get("default_model", "claude-sonnet-4-5")
@@ -112,7 +117,7 @@ class AnthropicProvider:
         self.use_streaming = self.config.get("use_streaming", True)
 
         # Get base_url from config for custom endpoints (proxies, local APIs, etc.)
-        base_url = self.config.get("base_url")
+        self._base_url = self.config.get("base_url")
 
         # Handle enable_1m_context from init wizard - translate to beta_headers
         # This bridges the config field (enable_1m_context boolean) to the actual
@@ -131,23 +136,33 @@ class AnthropicProvider:
         # Store as instance variable so we can merge with per-request headers later
         beta_headers_config = self.config.get("beta_headers")
         self._beta_headers: list[str] = []
-        default_headers = None
+        self._default_headers: dict[str, str] | None = None
         if beta_headers_config:
             # Normalize to list (supports string or list of strings)
             self._beta_headers = [beta_headers_config] if isinstance(beta_headers_config, str) else list(beta_headers_config)
             # Build anthropic-beta header value (comma-separated)
             beta_header_value = ",".join(self._beta_headers)
-            default_headers = {"anthropic-beta": beta_header_value}
+            self._default_headers = {"anthropic-beta": beta_header_value}
             logger.info(f"[PROVIDER] Beta headers enabled: {beta_header_value}")
-
-        # Initialize client with optional beta headers and base_url
-        self.client = AsyncAnthropic(api_key=api_key, base_url=base_url, default_headers=default_headers)
 
         # Track tool call IDs that have been repaired with synthetic results.
         # This prevents infinite loops when the same missing tool results are
         # detected repeatedly across LLM iterations (since synthetic results
         # are injected into request.messages but not persisted to message store).
         self._repaired_tool_ids: set[str] = set()
+
+    @property
+    def client(self) -> AsyncAnthropic:
+        """Lazily initialize the Anthropic client on first access."""
+        if self._client is None:
+            if self._api_key is None:
+                raise ValueError("api_key must be provided for API calls")
+            self._client = AsyncAnthropic(
+                api_key=self._api_key,
+                base_url=self._base_url,
+                default_headers=self._default_headers,
+            )
+        return self._client
 
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
