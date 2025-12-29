@@ -84,6 +84,7 @@ class AnthropicProvider:
     """
 
     name = "anthropic"
+    api_label = "Anthropic"
 
     def __init__(
         self, api_key: str, config: dict[str, Any] | None = None, coordinator: ModuleCoordinator | None = None
