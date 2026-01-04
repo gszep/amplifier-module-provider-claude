@@ -273,9 +273,8 @@ class AnthropicProvider:
                     )
                 )
 
-        # Sort result by family preference: sonnet first (default), then haiku, then opus
-        family_order = {"sonnet": 0, "haiku": 1, "opus": 2}
-        result.sort(key=lambda m: family_order.get(next((f for f in family_order if f in m.id.lower()), ""), 99))
+        # Sort alphabetically by display name
+        result.sort(key=lambda m: m.display_name.lower())
 
         return result
 
