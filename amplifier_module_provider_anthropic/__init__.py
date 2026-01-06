@@ -28,6 +28,7 @@ from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import ToolCall
 from anthropic import AsyncAnthropic
+from anthropic import RateLimitError
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,7 @@ class AnthropicProvider:
         self.raw_debug = self.config.get("raw_debug", False)  # Enable ultra-verbose raw API I/O logging
         self.debug_truncate_length = self.config.get("debug_truncate_length", 180)  # Max string length in debug logs
         self.timeout = self.config.get("timeout", 300.0)  # API timeout in seconds (default 5 minutes)
+        self.max_retries = self.config.get("max_retries", 2)  # SDK default is 2
         # Use streaming API by default to support large context windows (Anthropic requires streaming
         # for operations that may take > 10 minutes, e.g. with 300k+ token contexts)
         self.use_streaming = self.config.get("use_streaming", True)
@@ -162,6 +164,7 @@ class AnthropicProvider:
                 api_key=self._api_key,
                 base_url=self._base_url,
                 default_headers=self._default_headers,
+                max_retries=self.max_retries,  # Configurable retry count for rate limits
             )
         return self._client
 
@@ -423,6 +426,92 @@ class AnthropicProvider:
 
         return await self._complete_chat_request(request, **kwargs)
 
+    def _extract_rate_limit_headers(self, headers: dict[str, str] | Any) -> dict[str, Any]:
+        """Extract rate limit information from response headers.
+        
+        Anthropic returns rate limit headers on every response:
+        - anthropic-ratelimit-requests-limit/remaining/reset
+        - anthropic-ratelimit-tokens-limit/remaining/reset
+        - retry-after (on 429 errors)
+        
+        Args:
+            headers: Response headers (dict-like object)
+            
+        Returns:
+            Dict with rate limit info, or empty dict if headers unavailable
+        """
+        if not headers:
+            return {}
+        
+        # Helper to safely get header values
+        def get_int(key: str) -> int | None:
+            val = headers.get(key)
+            if val is not None:
+                try:
+                    return int(val)
+                except (ValueError, TypeError):
+                    pass
+            return None
+        
+        info: dict[str, Any] = {}
+        
+        # Request limits
+        requests_remaining = get_int("anthropic-ratelimit-requests-remaining")
+        requests_limit = get_int("anthropic-ratelimit-requests-limit")
+        if requests_remaining is not None:
+            info["requests_remaining"] = requests_remaining
+        if requests_limit is not None:
+            info["requests_limit"] = requests_limit
+        
+        # Token limits
+        tokens_remaining = get_int("anthropic-ratelimit-tokens-remaining")
+        tokens_limit = get_int("anthropic-ratelimit-tokens-limit")
+        if tokens_remaining is not None:
+            info["tokens_remaining"] = tokens_remaining
+        if tokens_limit is not None:
+            info["tokens_limit"] = tokens_limit
+        
+        # Retry-after (typically only on 429)
+        if retry_after := headers.get("retry-after"):
+            try:
+                info["retry_after_seconds"] = float(retry_after)
+            except (ValueError, TypeError):
+                pass
+        
+        return info
+
+    def _parse_rate_limit_info(self, error: RateLimitError) -> dict[str, Any]:
+        """Extract rate limit details from RateLimitError.
+        
+        The SDK provides headers via error.response.headers when available.
+        """
+        info: dict[str, Any] = {
+            "retry_after_seconds": None,
+            "rate_limit_type": None,
+        }
+        
+        # RateLimitError may have response with headers
+        if hasattr(error, "response") and error.response:
+            headers = getattr(error.response, "headers", {})
+            
+            # Parse retry-after (seconds as float)
+            if retry_after := headers.get("retry-after"):
+                try:
+                    info["retry_after_seconds"] = float(retry_after)
+                except (ValueError, TypeError):
+                    pass
+            
+            # Determine limit type from remaining tokens
+            tokens_remaining = headers.get("anthropic-ratelimit-tokens-remaining")
+            requests_remaining = headers.get("anthropic-ratelimit-requests-remaining")
+            
+            if tokens_remaining == "0":
+                info["rate_limit_type"] = "tokens"
+            elif requests_remaining == "0":
+                info["rate_limit_type"] = "requests"
+        
+        return info
+
     async def _complete_chat_request(self, request: ChatRequest, **kwargs) -> ChatResponse:
         """Handle ChatRequest format with developer message conversion.
 
@@ -591,33 +680,53 @@ class AnthropicProvider:
         try:
             # Use streaming API to support large context windows (Anthropic requires streaming
             # for operations that may take > 10 minutes)
+            rate_limit_info: dict[str, Any] = {}
             if self.use_streaming:
                 async with asyncio.timeout(self.timeout):
                     async with self.client.messages.stream(**params) as stream:
                         response = await stream.get_final_message()
+                        # Capture rate limit headers from stream response
+                        if hasattr(stream, "response") and stream.response:
+                            rate_limit_info = self._extract_rate_limit_headers(stream.response.headers)
             else:
-                response = await asyncio.wait_for(self.client.messages.create(**params), timeout=self.timeout)
+                # Use with_raw_response to access headers
+                raw_response = await asyncio.wait_for(
+                    self.client.messages.with_raw_response.create(**params), 
+                    timeout=self.timeout
+                )
+                response = raw_response.parse()
+                rate_limit_info = self._extract_rate_limit_headers(raw_response.headers)
             elapsed_ms = int((time.time() - start_time) * 1000)
 
             logger.info("[PROVIDER] Received response from Anthropic API")
             logger.debug(f"[PROVIDER] Response type: {response.model}")
+            
+            # Log rate limit status if available
+            if rate_limit_info:
+                tokens_remaining = rate_limit_info.get("tokens_remaining")
+                tokens_limit = rate_limit_info.get("tokens_limit")
+                if tokens_remaining is not None and tokens_limit is not None:
+                    pct_used = ((tokens_limit - tokens_remaining) / tokens_limit) * 100 if tokens_limit > 0 else 0
+                    logger.debug(f"[PROVIDER] Rate limit: {tokens_remaining:,}/{tokens_limit:,} tokens remaining ({pct_used:.1f}% used)")
 
             # Emit llm:response event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
-                # INFO level: Summary only
-                await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": "anthropic",
-                        "model": params["model"],
-                        "usage": {
-                            "input": response.usage.input_tokens,
-                            "output": response.usage.output_tokens,
-                        },
-                        "status": "ok",
-                        "duration_ms": elapsed_ms,
+                # INFO level: Summary with rate limit info
+                response_event: dict[str, Any] = {
+                    "provider": "anthropic",
+                    "model": params["model"],
+                    "usage": {
+                        "input": response.usage.input_tokens,
+                        "output": response.usage.output_tokens,
                     },
-                )
+                    "status": "ok",
+                    "duration_ms": elapsed_ms,
+                }
+                # Add rate limit info if available
+                if rate_limit_info:
+                    response_event["rate_limits"] = rate_limit_info
+                
+                await self.coordinator.hooks.emit("llm:response", response_event)
 
                 # DEBUG level: Full response with truncated values (if debug enabled)
                 if self.debug:
@@ -666,6 +775,51 @@ class AnthropicProvider:
                     },
                 )
             raise TimeoutError(error_msg) from None
+
+        except RateLimitError as e:
+            # Rate limit hit after SDK exhausted retries
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            
+            # Parse rate limit details
+            rate_info = self._parse_rate_limit_info(e)
+            retry_after = rate_info["retry_after_seconds"]
+            
+            # Build actionable error message
+            if retry_after:
+                error_msg = f"Rate limited by Anthropic API. Retry after {retry_after}s. (retries exhausted: {self.max_retries})"
+            else:
+                error_msg = f"Rate limited by Anthropic API. (retries exhausted: {self.max_retries})"
+            
+            logger.warning(f"[PROVIDER] {error_msg}")
+            
+            # Emit rate limit event for observability
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "anthropic:rate_limited",
+                    {
+                        "provider": "anthropic",
+                        "model": params["model"],
+                        "retry_after_seconds": retry_after,
+                        "retries_attempted": self.max_retries,
+                        "error_message": str(e),
+                        "rate_limit_type": rate_info["rate_limit_type"],
+                    },
+                )
+                
+                # Also emit standard error event for consistency
+                await self.coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "provider": "anthropic",
+                        "model": params["model"],
+                        "status": "rate_limited",
+                        "duration_ms": elapsed_ms,
+                        "error": error_msg,
+                    },
+                )
+            
+            # Re-raise with actionable message
+            raise RateLimitError(error_msg) from e
 
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)

@@ -71,6 +71,27 @@ providers:
       default_model: claude-sonnet-4-5
 ```
 
+### Rate Limit Configuration
+
+The provider uses the Anthropic SDK's built-in retry mechanism for rate limit errors (429) and server errors (5xx). Configure retry behavior:
+
+```yaml
+providers:
+  - module: provider-anthropic
+    config:
+      max_retries: 5  # Number of retry attempts (default: 2)
+```
+
+**Behavior:**
+- SDK automatically retries 429 (rate limit) and 5xx errors with exponential backoff
+- Default is 2 retries (SDK default)
+- Set to `0` to disable retries
+- When retries are exhausted, emits `anthropic:rate_limited` event with retry timing info
+
+**Events emitted on rate limit:**
+- `anthropic:rate_limited` - Detailed rate limit info including `retry_after_seconds`
+- `llm:response` with `status: "rate_limited"` - Standard error event
+
 ## Beta Headers
 
 Anthropic provides experimental features through beta headers. Enable these features by adding the `beta_headers` configuration field.
