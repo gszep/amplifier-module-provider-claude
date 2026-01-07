@@ -798,7 +798,8 @@ class AnthropicProvider:
             if retry_after:
                 error_msg += f" (retry-after: {retry_after}s)"
             
-            logger.warning(f"[PROVIDER] {error_msg}")
+            # Note: We don't log here - the error message will be displayed by the CLI
+            # when it catches the exception. Logging would cause duplicate output.
             
             # Emit rate limit exhausted event for observability
             if self.coordinator and hasattr(self.coordinator, "hooks"):
