@@ -1153,8 +1153,34 @@ class AnthropicProvider:
                 anthropic_messages.append({"role": "user", "content": wrapped})
                 i += 1
             else:
-                # User messages
-                anthropic_messages.append({"role": "user", "content": content})
+                # User messages - handle structured content (text + images)
+                if isinstance(content, list):
+                    content_blocks = []
+                    for block in content:
+                        if isinstance(block, dict):
+                            block_type = block.get("type")
+                            if block_type == "text":
+                                content_blocks.append({"type": "text", "text": block.get("text", "")})
+                            elif block_type == "image":
+                                # Convert ImageBlock to Anthropic image format
+                                source = block.get("source", {})
+                                if source.get("type") == "base64":
+                                    content_blocks.append({
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": source.get("media_type", "image/jpeg"),
+                                            "data": source.get("data")
+                                        }
+                                    })
+                                else:
+                                    logger.warning(f"Unsupported image source type: {source.get('type')}")
+                    
+                    if content_blocks:
+                        anthropic_messages.append({"role": "user", "content": content_blocks})
+                else:
+                    # Simple string content
+                    anthropic_messages.append({"role": "user", "content": content})
                 i += 1
 
         return anthropic_messages
