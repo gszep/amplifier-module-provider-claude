@@ -33,6 +33,10 @@ from amplifier_core.message_models import (
 
 logger = logging.getLogger(__name__)
 
+# Maximum size for system prompt to prevent "Argument list too long" errors
+# The kernel's ARG_MAX limit is ~2 MB, safe limit for system_prompt is ~500 KB
+MAX_SYSTEM_PROMPT_BYTES = 500_000
+
 
 class ClaudeChatResponse(ChatResponse):
     """ChatResponse with additional fields for streaming UI compatibility."""
@@ -219,6 +223,17 @@ class ClaudeProvider:
         # Extract prompt and system message from request
         prompt = self._extract_prompt(request)
         system_prompt = self._extract_system_prompt(request)
+
+        # Truncate system prompt if it exceeds the safe size limit
+        # This prevents "Argument list too long" errors from subprocess invocation
+        if system_prompt and len(system_prompt) > MAX_SYSTEM_PROMPT_BYTES:
+            original_size = len(system_prompt)
+            logger.warning(
+                f"System prompt truncated from {original_size:,} to {MAX_SYSTEM_PROMPT_BYTES:,} bytes "
+                f"to prevent 'Argument list too long' error when invoking Claude Code"
+            )
+            system_prompt = system_prompt[:MAX_SYSTEM_PROMPT_BYTES]
+            system_prompt += "\n\n[...truncated due to size limit...]"
 
         if not prompt:
             logger.warning("[PROVIDER] Claude Code: No user prompt found in request")
