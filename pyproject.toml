@@ -15,7 +15,6 @@ dependencies = [
 
 [project.entry-points."amplifier.modules"]
 provider-anthropic = "amplifier_module_provider_anthropic:mount"
-provider-claude-code = "amplifier_module_provider_anthropic.claude_code:mount"
 
 [build-system]
 requires = [
