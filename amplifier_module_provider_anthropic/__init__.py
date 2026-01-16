@@ -16,6 +16,9 @@ import random
 import time
 from typing import Any
 
+from dataclasses import dataclass
+from dataclasses import field
+
 from amplifier_core import ConfigField
 from amplifier_core import ModelInfo
 from amplifier_core import ModuleCoordinator
@@ -23,6 +26,16 @@ from amplifier_core import ProviderInfo
 from amplifier_core import TextContent
 from amplifier_core import ThinkingContent
 from amplifier_core import ToolCallContent
+
+
+@dataclass
+class WebSearchContent:
+    """Content block for web search results from native Anthropic web search."""
+
+    type: str = "web_search"
+    query: str = ""
+    results: list[dict[str, Any]] = field(default_factory=list)
+    citations: list[dict[str, str]] = field(default_factory=list)
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
@@ -36,8 +49,11 @@ logger = logging.getLogger(__name__)
 class AnthropicChatResponse(ChatResponse):
     """ChatResponse with additional fields for streaming UI compatibility."""
 
-    content_blocks: list[TextContent | ThinkingContent | ToolCallContent] | None = None
+    content_blocks: (
+        list[TextContent | ThinkingContent | ToolCallContent | WebSearchContent] | None
+    ) = None
     text: str | None = None
+    web_search_results: list[dict[str, Any]] | None = None
 
 
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
@@ -154,6 +170,9 @@ class AnthropicProvider:
             "filtered", True
         )  # Filter to curated model list by default
         self.enable_prompt_caching = self.config.get("enable_prompt_caching", True)
+        self.enable_web_search = self.config.get(
+            "enable_web_search", False
+        )  # Enable native web search tool
 
         # Get base_url from config for custom endpoints (proxies, local APIs, etc.)
         self._base_url = self.config.get("base_url")
@@ -729,6 +748,17 @@ class AnthropicProvider:
             if tool_choice := kwargs.get("tool_choice"):
                 params["tool_choice"] = tool_choice
 
+        # Add native web search tool if enabled (via config or kwargs)
+        # This is a model-native tool that doesn't need function conversion
+        web_search_enabled = kwargs.get("enable_web_search", self.enable_web_search)
+        if web_search_enabled:
+            web_search_tool = self._build_web_search_tool(kwargs)
+            if "tools" not in params:
+                params["tools"] = []
+            # Add web search tool at the beginning (native tools typically come first)
+            params["tools"].insert(0, web_search_tool)
+            logger.info("[PROVIDER] Native web search tool enabled")
+
         # Enable extended thinking if requested (equivalent to OpenAI's reasoning)
         thinking_enabled = bool(kwargs.get("extended_thinking"))
         thinking_budget = None
@@ -1144,6 +1174,17 @@ class AnthropicProvider:
                 "tool_use_id": block.get("tool_use_id", ""),
                 "content": block.get("content", ""),
             }
+        if block_type == "web_search_tool_result":
+            # Web search results are model-native and should be passed through
+            # with minimal cleaning (just remove internal fields)
+            cleaned: dict[str, Any] = {
+                "type": "web_search_tool_result",
+            }
+            if "tool_use_id" in block:
+                cleaned["tool_use_id"] = block["tool_use_id"]
+            if "content" in block:
+                cleaned["content"] = block["content"]
+            return cleaned
         # Unknown block type - return as-is but remove visibility
         cleaned = dict(block)
         cleaned.pop("visibility", None)
@@ -1385,22 +1426,146 @@ class AnthropicProvider:
     def _convert_tools_from_request(self, tools: list) -> list[dict[str, Any]]:
         """Convert ToolSpec objects from ChatRequest to Anthropic format.
 
+        Handles both standard function tools (converted to Anthropic format) and
+        model-native tools like web_search_20250305 (passed through unchanged).
+
+        Model-native tools are identified by having a 'type' attribute that is NOT
+        'function'. These tools use Anthropic's built-in capabilities and should
+        NOT be converted to the standard function tool format.
+
         Args:
-            tools: List of ToolSpec objects
+            tools: List of ToolSpec objects or native tool definitions
 
         Returns:
             List of Anthropic-formatted tool definitions
         """
         anthropic_tools = []
         for tool in tools:
-            anthropic_tools.append(
-                {
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "input_schema": tool.parameters,
-                }
-            )
+            # Check if this is a model-native tool (has 'type' that's not 'function')
+            # Native tools like web_search_20250305 are passed through unchanged
+            tool_type = getattr(tool, "type", None)
+            if tool_type and tool_type != "function":
+                # Model-native tool - pass through as-is (converted to dict if needed)
+                if hasattr(tool, "model_dump"):
+                    anthropic_tools.append(tool.model_dump(exclude_none=True))
+                elif isinstance(tool, dict):
+                    anthropic_tools.append(tool)
+                else:
+                    # Fallback: build dict from known attributes
+                    native_tool: dict[str, Any] = {"type": tool_type}
+                    if hasattr(tool, "name") and tool.name:
+                        native_tool["name"] = tool.name
+                    # Add any additional config (e.g., max_uses for web search)
+                    if hasattr(tool, "max_uses") and tool.max_uses is not None:
+                        native_tool["max_uses"] = tool.max_uses
+                    if hasattr(tool, "user_location") and tool.user_location is not None:
+                        native_tool["user_location"] = tool.user_location
+                    anthropic_tools.append(native_tool)
+                logger.debug(f"[PROVIDER] Added native tool: {tool_type}")
+            else:
+                # Standard function tool - convert to Anthropic format
+                anthropic_tools.append(
+                    {
+                        "name": tool.name,
+                        "description": tool.description or "",
+                        "input_schema": tool.parameters,
+                    }
+                )
         return anthropic_tools
+
+    def _extract_web_search_citations(self, block: Any) -> list[dict[str, Any]]:
+        """Extract citation information from a web search result block.
+
+        Web search results contain citations with source information that can be
+        displayed to users for transparency and attribution.
+
+        Args:
+            block: Web search tool result block from Anthropic response
+
+        Returns:
+            List of citation dicts with title, url, and optional snippet
+        """
+        citations = []
+
+        # Web search results have a 'content' field with search results
+        content = getattr(block, "content", None)
+        if not content:
+            return citations
+
+        # Content may be a list of result items or a single object
+        results = content if isinstance(content, list) else [content]
+
+        for result in results:
+            # Each result may have source information
+            if hasattr(result, "type") and result.type == "web_search_result":
+                citation: dict[str, Any] = {}
+
+                # Extract URL (required)
+                if hasattr(result, "url") and result.url:
+                    citation["url"] = result.url
+                elif hasattr(result, "source_url") and result.source_url:
+                    citation["url"] = result.source_url
+
+                # Extract title
+                if hasattr(result, "title") and result.title:
+                    citation["title"] = result.title
+
+                # Extract snippet/description
+                if hasattr(result, "snippet") and result.snippet:
+                    citation["snippet"] = result.snippet
+                elif hasattr(result, "description") and result.description:
+                    citation["snippet"] = result.description
+                elif hasattr(result, "encrypted_content") and result.encrypted_content:
+                    # Some results use encrypted_content - just note it exists
+                    citation["has_content"] = True
+
+                # Only add if we have at least a URL
+                if citation.get("url"):
+                    citations.append(citation)
+
+        return citations
+
+    def _build_web_search_tool(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Build the native web search tool definition.
+
+        The web_search_20250305 tool is a model-native tool that enables Claude
+        to search the web for current information. Unlike function tools, it uses
+        Anthropic's built-in web search capability.
+
+        Tool definition format:
+            {
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 5,  # optional, limits searches per request
+                "user_location": {...}  # optional, for location-aware results
+            }
+
+        Args:
+            kwargs: Request kwargs that may contain web search configuration
+
+        Returns:
+            Web search tool definition dict
+        """
+        tool: dict[str, Any] = {
+            "type": "web_search_20250305",
+            "name": "web_search",  # Anthropic requires this exact name
+        }
+
+        # Optional: max_uses limits number of searches per request
+        max_uses = kwargs.get("web_search_max_uses") or self.config.get(
+            "web_search_max_uses"
+        )
+        if max_uses is not None:
+            tool["max_uses"] = max_uses
+
+        # Optional: user_location for location-aware search results
+        user_location = kwargs.get("web_search_user_location") or self.config.get(
+            "web_search_user_location"
+        )
+        if user_location is not None:
+            tool["user_location"] = user_location
+
+        return tool
 
     def _apply_tool_cache_control(
         self, tools: list[dict[str, Any]]
@@ -1476,7 +1641,10 @@ class AnthropicProvider:
 
         content_blocks = []
         tool_calls = []
-        event_blocks: list[TextContent | ThinkingContent | ToolCallContent] = []
+        web_search_results: list[dict[str, Any]] = []
+        event_blocks: list[
+            TextContent | ThinkingContent | ToolCallContent | WebSearchContent
+        ] = []
         text_accumulator: list[str] = []
 
         for block in response.content:
@@ -1503,6 +1671,27 @@ class AnthropicProvider:
                 )
                 event_blocks.append(
                     ToolCallContent(id=block.id, name=block.name, arguments=block.input)
+                )
+            elif block.type == "web_search_tool_result":
+                # Handle native web search results from Anthropic
+                # Extract citations from search results for observability
+                citations = self._extract_web_search_citations(block)
+                web_search_results.append(
+                    {
+                        "type": "web_search_tool_result",
+                        "tool_use_id": getattr(block, "tool_use_id", None),
+                        "citations": citations,
+                    }
+                )
+                # Add to event blocks for UI display
+                event_blocks.append(
+                    WebSearchContent(
+                        query=getattr(block, "query", ""),
+                        citations=citations,
+                    )
+                )
+                logger.debug(
+                    f"[PROVIDER] Web search returned {len(citations)} citations"
                 )
 
         # Build usage dict with cache metrics if available
@@ -1539,4 +1728,5 @@ class AnthropicProvider:
             finish_reason=response.stop_reason,
             content_blocks=event_blocks if event_blocks else None,
             text=combined_text or None,
+            web_search_results=web_search_results if web_search_results else None,
         )
