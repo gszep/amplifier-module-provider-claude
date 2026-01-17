@@ -178,6 +178,11 @@ class ClaudeProvider:
 
         Uses stream-json output format to emit content_block events as text arrives,
         enabling real-time UI updates while still returning a complete ChatResponse.
+
+        Session Continuity:
+        - If request.metadata contains 'claude_session_id', resumes that session
+        - Response metadata always includes 'claude_session_id' for future continuity
+        - Use --resume flag to continue multi-turn conversations
         """
         start_time = time.time()
 
@@ -192,6 +197,10 @@ class ClaudeProvider:
         model = getattr(request, "model", None) or self.default_model
         prompt = self._extract_prompt(request)
 
+        # Check for existing session to resume
+        request_metadata = getattr(request, "metadata", None) or {}
+        existing_session_id = request_metadata.get("claude_session_id")
+
         # Build command with streaming JSON output for real-time events
         # --verbose is required for stream-json format
         # --include-partial-messages gives us content_block_delta events
@@ -204,13 +213,27 @@ class ClaudeProvider:
             "stream-json",  # Real-time streaming
             "--verbose",  # Required for stream-json
             "--include-partial-messages",  # Get content deltas
-            "--system-prompt",
-            "You are a helpful AI assistant. Answer the user's request directly.",
-            prompt,
         ]
 
+        # Add session resumption if we have an existing session
+        if existing_session_id:
+            cmd.extend(["--resume", existing_session_id])
+            logger.info(f"[PROVIDER] Resuming Claude session: {existing_session_id}")
+        else:
+            # Only set system prompt for new sessions
+            cmd.extend(
+                [
+                    "--system-prompt",
+                    "You are a helpful AI assistant. Answer the user's request directly.",
+                ]
+            )
+
+        # Add the prompt
+        cmd.append(prompt)
+
         logger.info(
-            f"[PROVIDER] Claude CLI streaming: model={model}, prompt_len={len(prompt)}"
+            f"[PROVIDER] Claude CLI streaming: model={model}, prompt_len={len(prompt)}, "
+            f"resume={'yes' if existing_session_id else 'no'}"
         )
 
         # Start the process
@@ -361,8 +384,11 @@ class ClaudeProvider:
                     response_text = event_data.get("result", "")
 
                 usage_data = event_data.get("usage", {})
+                # Store session_id with consistent key for resumption
+                session_id = event_data.get("session_id")
                 metadata = {
-                    "session_id": event_data.get("session_id"),
+                    "claude_session_id": session_id,  # Key for session continuity
+                    "session_id": session_id,  # Also keep original key
                     "duration_ms": event_data.get("duration_ms"),
                     "duration_api_ms": event_data.get("duration_api_ms"),
                     "cost_usd": event_data.get("total_cost_usd"),
