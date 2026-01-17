@@ -21,24 +21,36 @@ from amplifier_core import (  # type: ignore
     ModelInfo,
     ModuleCoordinator,
     ProviderInfo,
+    TextContent,
+    ThinkingContent,
+    ToolCallContent,
 )
-from amplifier_core.content_models import TextContent  # type: ignore
 from amplifier_core.events import (  # type: ignore
     CONTENT_BLOCK_DELTA,
     CONTENT_BLOCK_END,
     CONTENT_BLOCK_START,
 )
+
 from amplifier_core.message_models import (  # type: ignore
     ChatRequest,
     ChatResponse,
     Message,
     TextBlock,
+    ThinkingBlock,
     ToolCall,
     ToolCallBlock,
     Usage,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class ClaudeChatResponse(ChatResponse):
+    """ChatResponse with additional fields for streaming UI compatibility."""
+
+    content_blocks: list[TextContent | ThinkingContent | ToolCallContent] | None = None
+    text: str | None = None
+
 
 # -----------------------------------------------------------------------------
 # Constants
@@ -51,6 +63,8 @@ METADATA_DURATION_MS = "claude:duration_ms"
 DEFAULT_MODEL = "sonnet"
 DEFAULT_TIMEOUT = 300.0
 DEFAULT_MAX_TOKENS = 64000
+DEFAULT_MAX_THINKING_TOKENS = 10240  # 10K thinking budget - good middle ground
+MIN_THINKING_TOKENS = 1024  # API minimum
 
 # Model specifications
 MODELS = {
@@ -73,7 +87,11 @@ MODELS = {
         "display_name": "Claude Haiku",
         "context_window": 200000,
         "max_output_tokens": 64000,
-        "capabilities": ["tools", "streaming"],
+        "capabilities": [
+            "tools",
+            "streaming",
+            "thinking",
+        ],  # Haiku 4.5 supports thinking
     },
 }
 
@@ -152,6 +170,10 @@ class ClaudeProvider:
         self.default_model = self.config.get("default_model", DEFAULT_MODEL)
         self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
         self.debug = self.config.get("debug", False)
+        self.max_thinking_tokens = max(
+            MIN_THINKING_TOKENS,
+            self.config.get("max_thinking_tokens", DEFAULT_MAX_THINKING_TOKENS),
+        )
 
     def get_info(self) -> ProviderInfo:
         """Return provider information.
@@ -576,10 +598,14 @@ Important:
             cmd.extend(["--resume", session_id])
             logger.info(f"[PROVIDER] Resuming Claude session: {session_id}")
 
+        # Enable extended thinking for models that support it
+        if self.max_thinking_tokens > 0:
+            cmd.extend(["--max-thinking-tokens", str(self.max_thinking_tokens)])
+
         return cmd
 
     async def _execute_cli(self, cmd: list[str], prompt: str) -> dict[str, Any]:
-        """Execute the CLI command and parse streaming output.
+        """Execute the CLI command and parse output.
 
         Args:
             cmd: The command to execute.
@@ -588,6 +614,7 @@ Important:
         Returns:
             Dictionary with parsed response data.
         """
+        logger.debug("[PROVIDER] Executing Claude CLI")
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
@@ -605,9 +632,9 @@ Important:
         response_text = ""
         usage_data: dict[str, Any] = {}
         metadata: dict[str, Any] = {}
-        tool_calls: list[dict[str, Any]] = []
+        thinking_text = ""
+        thinking_signature = ""
         block_index = 0
-        block_started = False
 
         assert proc.stdout is not None
 
@@ -625,58 +652,86 @@ Important:
 
             event_type = event_data.get("type")
 
-            # Handle stream events (content deltas)
-            if event_type == "stream_event":
-                inner_event = event_data.get("event", {})
-                inner_type = inner_event.get("type")
+            # Handle assistant messages - extract content blocks directly
+            if event_type == "assistant":
+                message = event_data.get("message", {})
+                content_blocks = message.get("content", [])
 
-                if inner_type == "content_block_start":
-                    block_started = True
-                    await self._emit_event(
-                        CONTENT_BLOCK_START,
-                        {
-                            "index": block_index,
-                            "content_block": inner_event.get("content_block", {}),
-                        },
-                    )
+                for block in content_blocks:
+                    block_type = block.get("type")
 
-                elif inner_type == "content_block_delta":
-                    delta = inner_event.get("delta", {})
-                    if delta.get("type") == "text_delta":
-                        text_chunk = delta.get("text", "")
-                        response_text += text_chunk
+                    if block_type == "thinking":
+                        # Extract thinking content and signature
+                        thinking_text = block.get("thinking", "")
+                        thinking_signature = block.get("signature", "")
+                        logger.debug(
+                            f"[PROVIDER] Thinking block: {len(thinking_text)} chars"
+                        )
 
+                        # Emit streaming events for thinking block
+                        await self._emit_event(
+                            CONTENT_BLOCK_START,
+                            {
+                                "index": block_index,
+                                "content_block": ThinkingBlock(
+                                    thinking="",
+                                    signature=thinking_signature,
+                                ),
+                            },
+                        )
                         await self._emit_event(
                             CONTENT_BLOCK_DELTA,
                             {
                                 "index": block_index,
-                                "delta": TextContent(text=text_chunk),
+                                "delta": ThinkingBlock(
+                                    thinking=thinking_text,
+                                    signature=thinking_signature,
+                                ),
                             },
                         )
+                        await self._emit_event(
+                            CONTENT_BLOCK_END,
+                            {
+                                "index": block_index,
+                                "content_block": ThinkingBlock(
+                                    thinking=thinking_text,
+                                    signature=thinking_signature,
+                                ),
+                            },
+                        )
+                        block_index += 1
 
-                elif inner_type == "content_block_stop":
-                    if block_started:
+                    elif block_type == "text":
+                        # Extract text content
+                        response_text = block.get("text", "")
+
+                        # Emit streaming events for text block
+                        await self._emit_event(
+                            CONTENT_BLOCK_START,
+                            {
+                                "index": block_index,
+                                "content_block": {"type": "text"},
+                            },
+                        )
+                        await self._emit_event(
+                            CONTENT_BLOCK_DELTA,
+                            {
+                                "index": block_index,
+                                "delta": {
+                                    "type": "text_delta",
+                                    "text": response_text,
+                                },
+                            },
+                        )
                         await self._emit_event(
                             CONTENT_BLOCK_END,
                             {"index": block_index},
                         )
                         block_index += 1
-                        block_started = False
-
-            # Handle assistant messages
-            elif event_type == "assistant":
-                message = event_data.get("message", {})
-                content_blocks = message.get("content", [])
-
-                for block in content_blocks:
-                    if block.get("type") == "text":
-                        # Accumulate text if we missed it from streaming
-                        text = block.get("text", "")
-                        if text and text not in response_text:
-                            response_text += text
 
             # Handle final result
             elif event_type == "result":
+                # Use result text as fallback
                 if not response_text:
                     response_text = event_data.get("result", "")
 
@@ -708,6 +763,8 @@ Important:
             "tool_calls": tool_calls,
             "usage": usage_data,
             "metadata": metadata,
+            "thinking": thinking_text,
+            "thinking_signature": thinking_signature,
         }
 
     # -------------------------------------------------------------------------
@@ -767,15 +824,15 @@ Important:
 
     def _build_response(
         self, response_data: dict[str, Any], duration: float
-    ) -> ChatResponse:
-        """Build a ChatResponse from parsed response data.
+    ) -> ClaudeChatResponse:
+        """Build a ClaudeChatResponse from parsed response data.
 
         Args:
             response_data: Parsed response from CLI.
             duration: Request duration in seconds.
 
         Returns:
-            ChatResponse object.
+            ClaudeChatResponse object with content_blocks for UI compatibility.
         """
         raw_text = response_data.get("text", "")
         tool_call_dicts = response_data.get("tool_calls", [])
@@ -785,11 +842,29 @@ Important:
         # Clean response text (remove tool_use blocks)
         clean_text = self._clean_response_text(raw_text)
 
-        # Build content blocks
+        # Build content blocks - ORDER: thinking -> text -> tool_use
         content_blocks: list[Any] = []
+        # Build event_blocks for streaming UI compatibility (like Anthropic provider)
+        event_blocks: list[TextContent | ThinkingContent | ToolCallContent] = []
 
+        # Add thinking block first if present (with signature preservation)
+        thinking_content = response_data.get("thinking", "")
+        thinking_sig = response_data.get("thinking_signature", "")
+        if thinking_content:
+            thinking_block = ThinkingBlock(
+                thinking=thinking_content,
+                signature=thinking_sig,
+                visibility="internal",
+            )
+            logger.debug(f"[PROVIDER] ThinkingBlock: {len(thinking_content)} chars")
+            content_blocks.append(thinking_block)
+            # Add ThinkingContent for UI streaming compatibility
+            event_blocks.append(ThinkingContent(text=thinking_content))
+
+        # Then text block
         if clean_text:
-            content_blocks.append(TextBlock(type="text", text=clean_text))
+            content_blocks.append(TextBlock(text=clean_text))
+            event_blocks.append(TextContent(text=clean_text))
 
         # Add tool call blocks to content
         for tc in tool_call_dicts:
@@ -798,6 +873,13 @@ Important:
                     id=tc["id"],
                     name=tc["name"],
                     input=tc["arguments"],
+                )
+            )
+            event_blocks.append(
+                ToolCallContent(
+                    id=tc["id"],
+                    name=tc["name"],
+                    arguments=tc["arguments"],
                 )
             )
 
@@ -835,12 +917,14 @@ Important:
             f"(tokens: {total_input} in, {output_tokens} out)"
         )
 
-        return ChatResponse(
+        return ClaudeChatResponse(
             content=content_blocks,
             tool_calls=tool_calls,
             usage=usage,
             finish_reason=finish_reason,
             metadata=metadata,
+            content_blocks=event_blocks if event_blocks else None,
+            text=clean_text or None,
         )
 
     # -------------------------------------------------------------------------
