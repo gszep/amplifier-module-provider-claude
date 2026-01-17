@@ -1,6 +1,8 @@
 # Amplifier Claude Provider Module
 
-Claude model integration for Amplifier using Claude Code CLI with **Full Control** architecture.
+**Use your Claude Max/Pro subscription with Amplifier** - no API keys or per-token billing required.
+
+This provider integrates Claude models via the Claude Code CLI, enabling Amplifier users to leverage their existing Claude subscription instead of paying for API access.
 
 ## Architecture
 
@@ -90,7 +92,7 @@ Provides access to Anthropic's Claude models (Sonnet, Opus, Haiku) via Claude Co
 ## Installation
 
 ```bash
-amplifier module add provider-claude --source git+https://github.com/gszep/amplifier-module-provider-claude
+amplifier module add provider-claude --source git+https://github.com/gszep/amplifier-module-provider-claude@main
 ```
 
 ## Configuration

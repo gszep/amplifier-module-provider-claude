@@ -479,19 +479,19 @@ class ClaudeProvider:
 
         for tool in tools:
             if hasattr(tool, "name"):
-                # ToolSpec object
+                # ToolSpec object - use "parameters" (ToolSpec field name)
                 tool_def = {
                     "name": tool.name,
                     "description": getattr(tool, "description", ""),
-                    "input_schema": getattr(tool, "input_schema", {}),
+                    "input_schema": getattr(tool, "parameters", {}),
                 }
             elif isinstance(tool, dict):
-                # Dictionary format
+                # Dictionary format - prefer "parameters" (ToolSpec convention)
                 tool_def = {
                     "name": tool.get("name", ""),
                     "description": tool.get("description", ""),
                     "input_schema": tool.get(
-                        "input_schema", tool.get("parameters", {})
+                        "parameters", tool.get("input_schema", {})
                     ),
                 }
             else:
@@ -518,6 +518,11 @@ class ClaudeProvider:
         return f"""You have access to the following tools:
 
 {tools_json}
+
+CRITICAL - Follow the input_schema exactly:
+- For "enum" fields, ONLY use values listed in the enum array
+- For "required" fields, you MUST provide a value
+- Do NOT invent parameter names or values not defined in the schema
 
 To use a tool, output a tool_use block in this exact format:
 <tool_use>
