@@ -1,6 +1,43 @@
 # Amplifier Claude Provider Module
 
-Claude model integration for Amplifier via direct Claude Code CLI integration.
+Claude model integration for Amplifier using Claude Code CLI with **Full Control** architecture.
+
+## Architecture
+
+This provider follows the same pattern as the official OpenAI provider:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Amplifier Orchestrator                                     │
+│      │                                                      │
+│      ▼                                                      │
+│  1. Send request with messages + tools                      │
+│      │                                                      │
+│      ▼                                                      │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  ClaudeProvider.complete()                          │   │
+│  │  - Converts messages to Claude format               │   │
+│  │  - Injects tool definitions via system prompt       │   │
+│  │  - Invokes Claude Code CLI (--tools "" disabled)    │   │
+│  │  - Parses response for tool_use blocks              │   │
+│  │  - Returns ChatResponse with tool_calls             │   │
+│  └─────────────────────────────────────────────────────┘   │
+│      │                                                      │
+│      ▼                                                      │
+│  2. Orchestrator executes tools                             │
+│      │                                                      │
+│      ▼                                                      │
+│  3. Send request with tool results added to messages        │
+│      │                                                      │
+│      ▼                                                      │
+│  4. Repeat until no more tool_calls                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key insight**: Claude Code's built-in tools are disabled (`--tools ""`). Amplifier's orchestrator has full control over tool execution, enabling:
+- Use of Amplifier's tool ecosystem
+- Tool execution policies and approvals
+- Consistent behavior across providers
 
 ## Prerequisites
 
@@ -31,35 +68,10 @@ Provides access to Anthropic's Claude models (Sonnet, Opus, Haiku) via Claude Co
 ### Key Features
 
 - **No API key required** - Uses Claude Code's authentication (Claude Max subscription)
-- **Unlimited context size** - Bypasses ARG_MAX limits via file-based system prompts
-- **High throughput** - Stdin streaming for prompts, stdout streaming for responses
+- **Full Control mode** - Amplifier orchestrator handles all tool execution
+- **Streaming support** - Real-time content streaming via stream-json
 - **Session continuity** - Continue/resume conversation sessions
 - **Zero SDK dependencies** - Direct CLI integration via subprocess
-
-## Architecture
-
-This provider bypasses the `claude-agent-sdk` limitations by using direct CLI invocation:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Amplifier Provider                                              │
-│                                                                  │
-│  1. System prompt → temp file (bypasses ARG_MAX)                │
-│  2. CLI: claude --system-prompt-file /tmp/xxx.txt               │
-│          --input-format stream-json                             │
-│  3. User prompt → stdin (NDJSON, unlimited size)                │
-│  4. Response ← stdout (stream-json parsing)                     │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Why Direct CLI?
-
-The `claude-agent-sdk` passes system prompts as CLI arguments, hitting OS ARG_MAX limits (~500KB). For agentic tools with large context windows, this is a blocker.
-
-| Approach | System Prompt Limit | User Prompt Limit |
-|----------|--------------------|--------------------|
-| `claude-agent-sdk` | ~500 KB (ARG_MAX) | ~500 KB (ARG_MAX) |
-| **Direct CLI** | **Unlimited** (file) | **Unlimited** (stdin) |
 
 ## Contract
 
@@ -69,9 +81,17 @@ The `claude-agent-sdk` passes system prompts as CLI arguments, hitting OS ARG_MA
 
 ## Supported Models
 
-- `sonnet` - Claude Sonnet (recommended, default)
-- `opus` - Claude Opus (most capable, extended thinking)
-- `haiku` - Claude Haiku (fastest)
+| Model | ID | Description |
+|-------|------|-------------|
+| Claude Sonnet | `sonnet` | Recommended default, good balance |
+| Claude Opus | `opus` | Most capable, extended thinking |
+| Claude Haiku | `haiku` | Fastest responses |
+
+## Installation
+
+```bash
+amplifier module add provider-claude --source git+https://github.com/gszep/amplifier-module-provider-claude
+```
 
 ## Configuration
 
@@ -81,112 +101,121 @@ providers:
     name: claude
     config:
       default_model: sonnet
-      max_turns: 1
+      timeout: 300.0
       debug: false
-      # Optional: working directory for sessions
-      cwd: /path/to/project
-      # Optional: permission mode (default, plan, acceptEdits, bypassPermissions)
-      permission_mode: default
-      # Optional: auto-continue previous session
-      auto_continue: false
 ```
 
-### Tool Configuration
+### Configuration Options
 
-Control which Claude Code built-in tools are available:
-
-```yaml
-providers:
-  - module: provider-claude
-    config:
-      allowed_tools:
-        - Read
-        - Write
-        - Edit
-        - Bash
-        - Grep
-        - Glob
-      disallowed_tools:
-        - WebSearch
-        - WebFetch
-```
-
-### Available Built-in Tools
-
-| Tool | Description |
-|------|-------------|
-| `Read` | Read file contents |
-| `Write` | Write file contents |
-| `Edit` | Edit file contents |
-| `MultiEdit` | Edit multiple files |
-| `Bash` | Execute shell commands |
-| `Glob` | Find files by pattern |
-| `Grep` | Search file contents |
-| `LS` | List directory contents |
-| `WebFetch` | Fetch web content |
-| `WebSearch` | Search the web |
-| `Task` | Delegate to sub-agents |
-| `TodoRead` | Read todo list |
-| `TodoWrite` | Write todo list |
-| `NotebookRead` | Read Jupyter notebooks |
-| `NotebookEdit` | Edit Jupyter notebooks |
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `default_model` | string | `sonnet` | Default model (sonnet, opus, haiku) |
+| `timeout` | number | `300.0` | Request timeout in seconds |
+| `debug` | boolean | `false` | Enable debug logging |
 
 ## Usage
 
-```python
-# In amplifier configuration
-providers:
-  - module: provider-claude
-    name: claude
-    config:
-      default_model: sonnet
+### Basic Usage
+
+```bash
+amplifier run --provider claude "What is the capital of France?"
 ```
+
+### With Tools
+
+Tools are automatically available through Amplifier's orchestrator:
+
+```bash
+amplifier run --provider claude "Search the web for recent news about AI"
+```
+
+The orchestrator will:
+1. Receive tool_calls from the provider
+2. Execute tools using mounted tool modules
+3. Send results back to the provider
+4. Continue until the response is complete
 
 ### Session Continuity
 
-Continue a previous session:
+Sessions are automatically managed via the `claude:session_id` metadata:
 
 ```python
-response = await provider.complete(
-    request,
-    continue_session=True,  # Continue last session in cwd
-)
+# First request - new session
+response1 = await provider.complete(request1)
+session_id = response1.metadata.get("claude:session_id")
 
-# Or resume a specific session:
-response = await provider.complete(
-    request,
-    session_id="session-uuid-here",
-)
+# Subsequent request - continues session
+request2.metadata = {"claude:session_id": session_id}
+response2 = await provider.complete(request2)
 ```
 
-## Features
+## How It Works
 
-- **Streaming support** - Real-time response streaming
-- **Tool use** - Full tool calling support with automatic mapping
-- **Extended thinking** - Supported on Opus model
-- **Session management** - Continue/resume conversations
-- **Unlimited context** - No ARG_MAX limitations
+### Tool Calling Flow
 
-## Dependencies
+1. **Tool Definition Injection**: Tool specs from `request.tools` are formatted as JSON and injected into the system prompt with instructions for Claude to output `<tool_use>` blocks.
 
-- `amplifier-core>=1.0.0`
-- Claude Code CLI (installed separately)
+2. **Built-in Tools Disabled**: The CLI is invoked with `--tools ""` which disables all of Claude Code's built-in tools (Read, Write, Bash, etc.).
 
-**No Python SDK dependencies** - This provider uses direct subprocess communication.
+3. **Tool Call Extraction**: The provider parses the response for `<tool_use>` blocks and converts them to `ToolCall` objects.
 
-## Events
+4. **Orchestrator Execution**: Amplifier's orchestrator receives the `tool_calls` and executes them using mounted tool modules.
 
-The provider emits standard Amplifier events:
+5. **Tool Results**: On the next `complete()` call, tool results are formatted as `<tool_result>` blocks in the conversation.
 
-- `llm:request` - Before CLI invocation (includes system_prompt_bytes for monitoring)
-- `llm:response` - After successful response (includes session_id for continuity)
+### Message Format
+
+The provider converts Amplifier's message format to Claude CLI format:
+
+| Amplifier Role | Claude Format |
+|----------------|---------------|
+| `system` | System prompt |
+| `user` | `Human: {content}` |
+| `assistant` | `Assistant: {content}` |
+| `tool` | `Human: <tool_result>...</tool_result>` |
+
+### Events Emitted
+
+| Event | When |
+|-------|------|
+| `llm:request` | Before CLI invocation |
+| `llm:response` | After successful response |
+| `content_block:start` | When streaming block starts |
+| `content_block:delta` | For each text chunk |
+| `content_block:end` | When streaming block ends |
+
+## Comparison with OpenAI Provider
+
+| Aspect | Claude Provider | OpenAI Provider |
+|--------|-----------------|-----------------|
+| Integration | CLI subprocess | Python SDK |
+| Authentication | Claude Max subscription | API key |
+| Tool Control | Full Control (orchestrator) | Full Control (orchestrator) |
+| Streaming | Native stream-json | Blocking API |
+| Dependencies | Zero (CLI only) | openai SDK |
 
 ## Error Handling
 
 | Error | Cause | Resolution |
 |-------|-------|------------|
-| `CLINotFoundError` | Claude Code CLI not installed | Run install script |
-| `CLIProcessError` | CLI returned non-zero exit | Check stderr output |
+| `RuntimeError: CLI not found` | Claude Code CLI not installed | Run install script |
+| `RuntimeError: CLI failed` | CLI returned non-zero exit | Check stderr output |
+
+## Development
+
+### Running Tests
+
+```bash
+uv run pytest tests/ -v
+```
+
+### Code Quality
+
+```bash
+uv run ruff check .
+uv run ruff format .
+uv run pyright
+```
 
 ## Contributing
 
