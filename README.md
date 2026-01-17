@@ -1,4 +1,4 @@
-# Amplifier Claude Provider Module
+# Amplifier Claude Code Provider Module
 
 **Use your Claude Max/Pro subscription with Amplifier** - no API keys or per-token billing required.
 
