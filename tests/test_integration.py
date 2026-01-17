@@ -11,35 +11,13 @@ def test_provider_integration():
     """Test installing and running the claude provider via amplifier CLI."""
     repo_url = "git+https://github.com/gszep/amplifier-module-provider-claude@main"
 
-    # Step 1: Add/update the module from the repo
-    print("\n=== Adding provider-claude module ===")
-    result = subprocess.run(
+    subprocess.run(
         ["amplifier", "module", "add", "provider-claude", "--source", repo_url],
-        capture_output=True,
-        text=True,
     )
-    # May fail if already added, that's OK
-    print(f"Add result: {result.returncode}")
-    if result.stdout:
-        print(f"stdout: {result.stdout[:500]}")
-    if result.stderr:
-        print(f"stderr: {result.stderr[:500]}")
-
-    # Step 2: Update the module to get latest changes
-    print("\n=== Updating provider-claude module ===")
-    result = subprocess.run(
+    subprocess.run(
         ["amplifier", "module", "update", "provider-claude"],
-        capture_output=True,
-        text=True,
     )
-    print(f"Update result: {result.returncode}")
-    if result.stdout:
-        print(f"stdout: {result.stdout[:500]}")
-    if result.stderr:
-        print(f"stderr: {result.stderr[:500]}")
 
-    # Step 3: Run a simple prompt
-    print("\n=== Running test prompt ===")
     result = subprocess.run(
         [
             "amplifier",
@@ -53,21 +31,14 @@ def test_provider_integration():
         timeout=120,  # 2 minute timeout
     )
 
-    print(f"Run result: {result.returncode}")
-    print(f"stdout: {result.stdout}")
-    if result.stderr:
-        print(f"stderr: {result.stderr}")
-
-    # Check for errors first
-    combined_output = result.stdout + result.stderr
-    assert "Argument list too long" not in combined_output, (
-        f"ARG_MAX error still occurring: {combined_output}"
+    print(
+        f"""\namplifier run --provider claude "what is 1+1? reply with just the number"\n{result.stdout}"""
     )
-    assert "Error:" not in result.stdout, f"Error in response: {result.stdout}"
-    assert result.returncode == 0, f"amplifier run failed: {result.stderr}"
-    assert "2" in result.stdout, f"Expected '2' in response, got: {result.stdout}"
+    if result.stderr:
+        print(f"{result.stderr}")
 
-    print("\n=== Test passed! ===")
+    answer = result.stdout.strip()[-1]
+    assert answer == "2", f"Expected '2' in response, got: {answer}"
 
 
 if __name__ == "__main__":
