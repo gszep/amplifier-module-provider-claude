@@ -9,8 +9,8 @@ authors = [
     { name = "Microsoft MADE:Explorations Team" },
 ]
 dependencies = [
-    "anthropic>=0.25.0",
-    "claude-agent-sdk>=0.1.19",
+    # No runtime dependencies - uses Claude Code CLI directly via subprocess
+    # Claude Code CLI must be installed: curl -fsSL https://claude.ai/install.sh | bash
 ]
 
 [project.entry-points."amplifier.modules"]

@@ -1,7 +1,8 @@
 """Claude provider module for Amplifier.
 
-Integrates with Claude Code CLI via claude-agent-sdk for Claude Max subscription usage.
-Enables using Amplifier with a Claude Max subscription instead of Anthropic API billing.
+Direct CLI integration with Claude Code for Claude Max subscription usage.
+Bypasses claude-agent-sdk limitations (ARG_MAX) by using file-based system prompts
+and stdin streaming for unlimited context sizes.
 """
 
 __all__ = ["mount", "ClaudeProvider"]
@@ -9,17 +10,20 @@ __all__ = ["mount", "ClaudeProvider"]
 # Amplifier module metadata
 __amplifier_module_type__ = "provider"
 
+import asyncio
+import json
 import logging
+import os
+import shutil
+import tempfile
 import time
+from pathlib import Path
 from typing import Any
 
 from amplifier_core import (
     ModelInfo,
     ModuleCoordinator,
     ProviderInfo,
-    TextContent,
-    ThinkingContent,
-    ToolCallContent,
 )
 from amplifier_core.message_models import (
     ChatRequest,
@@ -32,17 +36,6 @@ from amplifier_core.message_models import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Maximum size for system prompt to prevent "Argument list too long" errors
-# The kernel's ARG_MAX limit is ~2 MB, safe limit for system_prompt is ~500 KB
-MAX_SYSTEM_PROMPT_BYTES = 500_000
-
-
-class ClaudeChatResponse(ChatResponse):
-    """ChatResponse with additional fields for streaming UI compatibility."""
-
-    content_blocks: list[TextContent | ThinkingContent | ToolCallContent] | None = None
-    text: str | None = None
 
 
 # Claude Code built-in tools that can be allowed/disallowed
@@ -67,42 +60,65 @@ CLAUDE_CODE_BUILTIN_TOOLS = frozenset(
 )
 
 
+class ClaudeCodeCLIError(Exception):
+    """Base error for Claude Code CLI issues."""
+
+    pass
+
+
+class CLINotFoundError(ClaudeCodeCLIError):
+    """Claude Code CLI not found."""
+
+    pass
+
+
+class CLIProcessError(ClaudeCodeCLIError):
+    """Claude Code CLI process failed."""
+
+    def __init__(self, message: str, exit_code: int | None = None):
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
     """
-    Mount the Claude provider using Claude Code (Claude Max subscription).
+    Mount the Claude provider using direct Claude Code CLI integration.
 
-    This fork uses Claude Code CLI for all requests, enabling use of Claude Max
-    subscription instead of API billing.
+    This implementation bypasses claude-agent-sdk limitations by:
+    - Using --system-prompt-file for unlimited system prompt sizes
+    - Using --input-format stream-json for stdin-based prompts
+    - Streaming responses via stdout JSON parsing
 
     Args:
         coordinator: Module coordinator
         config: Provider configuration
 
     Returns:
-        Optional cleanup function (None - SDK manages its own resources)
+        Optional cleanup function
     """
     config = config or {}
 
     provider = ClaudeProvider(config, coordinator)
     await coordinator.mount("providers", provider, name="claude")
-    logger.info("Mounted ClaudeProvider (via Claude Code subscription)")
+    logger.info("Mounted ClaudeProvider (direct CLI integration)")
 
-    # No cleanup needed - claude-agent-sdk manages subprocess lifecycle
     return None
 
 
 class ClaudeProvider:
-    """Claude Code integration via claude-agent-sdk.
+    """Direct Claude Code CLI integration for Amplifier.
 
-    Provides Claude models through Claude Code CLI, using a Claude Max
-    subscription instead of direct API billing.
+    Provides Claude models through direct CLI invocation, using a Claude Max
+    subscription instead of API billing. Bypasses SDK limitations for
+    unlimited context sizes.
 
     Features:
     - Uses Claude Max subscription (no API key required)
+    - Unlimited system prompt size via --system-prompt-file
+    - Unlimited user prompt size via stdin streaming
     - Supports sonnet, opus, and haiku models
-    - Streaming responses via async iterator
-    - Tool calling support with automatic mapping
     - Session continuity (continue/resume)
+    - No subprocess argument length limits
     """
 
     name = "claude"
@@ -136,6 +152,43 @@ class ClaudeProvider:
 
         # Permission mode: 'default', 'plan', 'acceptEdits', 'bypassPermissions'
         self._permission_mode: str | None = self.config.get("permission_mode")
+
+        # Verify CLI is available
+        self._cli_path: str | None = None
+
+    def _find_cli(self) -> str:
+        """Find the Claude Code CLI executable.
+
+        Returns:
+            Path to the CLI executable
+
+        Raises:
+            CLINotFoundError: If CLI is not found
+        """
+        if self._cli_path:
+            return self._cli_path
+
+        # Check common locations
+        cli_path = shutil.which("claude")
+        if cli_path:
+            self._cli_path = cli_path
+            return cli_path
+
+        # Check npm global install locations
+        npm_paths = [
+            Path.home() / ".npm-global" / "bin" / "claude",
+            Path("/usr/local/bin/claude"),
+            Path.home() / ".local" / "bin" / "claude",
+        ]
+        for path in npm_paths:
+            if path.exists():
+                self._cli_path = str(path)
+                return self._cli_path
+
+        raise CLINotFoundError(
+            "Claude Code CLI not found. Please install it: "
+            "curl -fsSL https://claude.ai/install.sh | bash"
+        )
 
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
@@ -187,7 +240,10 @@ class ClaudeProvider:
 
     async def complete(self, request: ChatRequest, **kwargs) -> ChatResponse:
         """
-        Generate completion via Claude Code.
+        Generate completion via direct Claude Code CLI invocation.
+
+        Uses file-based system prompt and stdin streaming to bypass
+        ARG_MAX limitations, enabling unlimited context sizes.
 
         Args:
             request: Typed chat request with messages, tools, config
@@ -203,37 +259,21 @@ class ClaudeProvider:
         Returns:
             ChatResponse with content blocks, tool calls, usage
         """
-        # Import here to allow module to load even if claude-agent-sdk not installed
-        from claude_agent_sdk import (
-            AssistantMessage,
-            ClaudeAgentOptions,
-            ClaudeSDKError,
-            CLIConnectionError,
-            CLIJSONDecodeError,
-            CLINotFoundError,
-            ProcessError,
-            ToolUseBlock,
-            query,
-        )
-        from claude_agent_sdk import TextBlock as SDKTextBlock
-        from claude_agent_sdk import ThinkingBlock as SDKThinkingBlock
-
         start_time = time.time()
+
+        # Find CLI
+        try:
+            cli_path = self._find_cli()
+        except CLINotFoundError as e:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            await self._emit_error_event(
+                kwargs.get("model", self.default_model), str(e), elapsed_ms
+            )
+            raise RuntimeError(str(e)) from e
 
         # Extract prompt and system message from request
         prompt = self._extract_prompt(request)
         system_prompt = self._extract_system_prompt(request)
-
-        # Truncate system prompt if it exceeds the safe size limit
-        # This prevents "Argument list too long" errors from subprocess invocation
-        if system_prompt and len(system_prompt) > MAX_SYSTEM_PROMPT_BYTES:
-            original_size = len(system_prompt)
-            logger.warning(
-                f"System prompt truncated from {original_size:,} to {MAX_SYSTEM_PROMPT_BYTES:,} bytes "
-                f"to prevent 'Argument list too long' error when invoking Claude Code"
-            )
-            system_prompt = system_prompt[:MAX_SYSTEM_PROMPT_BYTES]
-            system_prompt += "\n\n[...truncated due to size limit...]"
 
         if not prompt:
             logger.warning("[PROVIDER] Claude Code: No user prompt found in request")
@@ -244,7 +284,7 @@ class ClaudeProvider:
                 finish_reason="error",
             )
 
-        # Build options for Claude Agent SDK
+        # Build options
         model = kwargs.get("model", self.default_model)
         max_turns = kwargs.get("max_turns", self.max_turns)
 
@@ -259,37 +299,10 @@ class ClaudeProvider:
         continue_session = kwargs.get("continue_session", False)
         resume_session_id = kwargs.get("session_id")
 
-        # Build ClaudeAgentOptions
-        options_kwargs: dict[str, Any] = {
-            "system_prompt": system_prompt,
-            "max_turns": max_turns,
-        }
-
-        if self._session_cwd:
-            options_kwargs["cwd"] = self._session_cwd
-
-        if allowed_tools:
-            options_kwargs["allowed_tools"] = allowed_tools
-
-        if disallowed_tools:
-            options_kwargs["disallowed_tools"] = disallowed_tools
-
-        if permission_mode:
-            options_kwargs["permission_mode"] = permission_mode
-
-        # Session continuity options
-        if continue_session:
-            options_kwargs["continue_session"] = True
-        elif resume_session_id:
-            options_kwargs["session_id"] = resume_session_id
-        elif self._last_session_id and kwargs.get("auto_continue", False):
-            options_kwargs["session_id"] = self._last_session_id
-
-        options = ClaudeAgentOptions(**options_kwargs)
-
         logger.info(
-            f"[PROVIDER] Claude Code API call - model: {model}, max_turns: {max_turns}, "
-            f"tools: {len(allowed_tools) if allowed_tools else 'default'}"
+            f"[PROVIDER] Claude Code CLI call - model: {model}, max_turns: {max_turns}, "
+            f"tools: {len(allowed_tools) if allowed_tools else 'default'}, "
+            f"system_prompt_size: {len(system_prompt) if system_prompt else 0} bytes"
         )
 
         # Emit request event
@@ -304,50 +317,237 @@ class ClaudeProvider:
                     "has_tools": bool(allowed_tools),
                     "continue_session": continue_session,
                     "resume_session": resume_session_id is not None,
+                    "system_prompt_bytes": len(system_prompt) if system_prompt else 0,
                 },
             )
 
-        # Collect response from async iterator
-        content_blocks: list[TextBlock | ThinkingBlock | ToolCallBlock] = []
-        tool_calls: list[ToolCall] = []
-        session_id: str | None = None
+        # Create temp file for system prompt (bypasses ARG_MAX)
+        system_prompt_file: str | None = None
+        try:
+            if system_prompt:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    suffix=".txt",
+                    delete=False,
+                    encoding="utf-8",
+                ) as f:
+                    f.write(system_prompt)
+                    system_prompt_file = f.name
+                logger.debug(
+                    f"[PROVIDER] Wrote system prompt to temp file: {system_prompt_file} "
+                    f"({len(system_prompt):,} bytes)"
+                )
+
+            # Build CLI command
+            cmd = self._build_command(
+                cli_path=cli_path,
+                model=model,
+                max_turns=max_turns,
+                system_prompt_file=system_prompt_file,
+                allowed_tools=allowed_tools,
+                disallowed_tools=disallowed_tools,
+                permission_mode=permission_mode,
+                continue_session=continue_session,
+                resume_session_id=resume_session_id,
+            )
+
+            # Execute CLI with stdin streaming
+            response = await self._execute_cli(cmd, prompt, model, start_time)
+            return response
+
+        finally:
+            # Clean up temp file
+            if system_prompt_file:
+                try:
+                    Path(system_prompt_file).unlink(missing_ok=True)
+                except Exception as e:
+                    logger.warning(f"Failed to clean up temp file: {e}")
+
+    def _build_command(
+        self,
+        cli_path: str,
+        model: str,
+        max_turns: int,
+        system_prompt_file: str | None,
+        allowed_tools: list[str] | None,
+        disallowed_tools: list[str] | None,
+        permission_mode: str | None,
+        continue_session: bool,
+        resume_session_id: str | None,
+    ) -> list[str]:
+        """Build the CLI command with all options.
+
+        Args:
+            cli_path: Path to claude CLI
+            model: Model name (sonnet, opus, haiku)
+            max_turns: Maximum agentic turns
+            system_prompt_file: Path to system prompt file (bypasses ARG_MAX)
+            allowed_tools: List of allowed tools
+            disallowed_tools: List of disallowed tools
+            permission_mode: Permission mode
+            continue_session: Whether to continue last session
+            resume_session_id: Session ID to resume
+
+        Returns:
+            Command list for subprocess
+        """
+        cmd = [
+            cli_path,
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",  # Stdin streaming for unlimited prompt size
+            "--model",
+            model,
+            "--max-turns",
+            str(max_turns),
+        ]
+
+        # System prompt via file (bypasses ARG_MAX entirely)
+        if system_prompt_file:
+            cmd.extend(["--system-prompt-file", system_prompt_file])
+
+        # Tool configuration
+        if allowed_tools:
+            cmd.extend(["--allowedTools", ",".join(allowed_tools)])
+
+        if disallowed_tools:
+            cmd.extend(["--disallowedTools", ",".join(disallowed_tools)])
+
+        # Permission mode
+        if permission_mode:
+            cmd.extend(["--permission-mode", permission_mode])
+
+        # Session continuity
+        if continue_session:
+            cmd.append("--continue")
+        elif resume_session_id:
+            cmd.extend(["--resume", resume_session_id])
+        elif self._last_session_id and self.config.get("auto_continue", False):
+            cmd.extend(["--resume", self._last_session_id])
+
+        # Working directory
+        if self._session_cwd:
+            cmd.extend(["--add-dir", self._session_cwd])
+
+        # Debug mode
+        if self.debug:
+            cmd.append("--verbose")
+
+        return cmd
+
+    async def _execute_cli(
+        self,
+        cmd: list[str],
+        prompt: str,
+        model: str,
+        start_time: float,
+    ) -> ChatResponse:
+        """Execute the CLI command and parse response.
+
+        Uses stdin streaming for the prompt, bypassing ARG_MAX for user input.
+
+        Args:
+            cmd: CLI command list
+            prompt: User prompt to send via stdin
+            model: Model name for event emission
+            start_time: Request start time for duration tracking
+
+        Returns:
+            ChatResponse with parsed content
+
+        Raises:
+            RuntimeError: On CLI execution failure
+        """
+        # Set up environment
+        env = os.environ.copy()
+        env["CLAUDE_CODE_ENTRYPOINT"] = "amplifier"
+
+        logger.debug(f"[PROVIDER] Executing: {' '.join(cmd[:5])}...")
 
         try:
-            async for message in query(prompt=prompt, options=options):
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, SDKTextBlock):
-                            content_blocks.append(TextBlock(text=block.text))
-                        elif isinstance(block, SDKThinkingBlock):
-                            content_blocks.append(
-                                ThinkingBlock(
-                                    thinking=block.thinking,
-                                    signature=getattr(block, "signature", None),
-                                )
-                            )
-                        elif isinstance(block, ToolUseBlock):
-                            content_blocks.append(
-                                ToolCallBlock(
-                                    id=block.id, name=block.name, input=block.input
-                                )
-                            )
-                            tool_calls.append(
-                                ToolCall(
-                                    id=block.id, name=block.name, arguments=block.input
-                                )
-                            )
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=self._session_cwd,
+            )
 
-                # Capture session ID for continuity
-                if hasattr(message, "session_id") and message.session_id:
-                    session_id = message.session_id
+            # Verify streams are available
+            if proc.stdin is None or proc.stdout is None or proc.stderr is None:
+                raise CLIProcessError("Failed to open subprocess streams", None)
 
-            # Store session ID for potential continuation
+            # Send prompt via stdin (NDJSON format)
+            # Format: {"type": "user", "message": {"role": "user", "content": "..."}}
+            input_msg = {
+                "type": "user",
+                "message": {"role": "user", "content": prompt},
+                "session_id": "default",
+            }
+            stdin_data = json.dumps(input_msg) + "\n"
+
+            # Write to stdin and close to signal end of input
+            proc.stdin.write(stdin_data.encode("utf-8"))
+            await proc.stdin.drain()
+            proc.stdin.close()
+            await proc.stdin.wait_closed()
+
+            # Read and parse streaming output
+            content_blocks: list[TextBlock | ThinkingBlock | ToolCallBlock] = []
+            tool_calls: list[ToolCall] = []
+            session_id: str | None = None
+            result_text: str | None = None
+
+            # Read stdout line by line (NDJSON)
+            async for line in proc.stdout:
+                line = line.decode("utf-8").strip()
+                if not line:
+                    continue
+
+                try:
+                    msg = json.loads(line)
+                    parsed = self._parse_message(msg)
+
+                    if parsed:
+                        if "content_blocks" in parsed:
+                            content_blocks.extend(parsed["content_blocks"])
+                        if "tool_calls" in parsed:
+                            tool_calls.extend(parsed["tool_calls"])
+                        if "session_id" in parsed:
+                            session_id = parsed["session_id"]
+                        if "result" in parsed:
+                            result_text = parsed["result"]
+
+                except json.JSONDecodeError as e:
+                    logger.warning(f"[PROVIDER] Failed to parse JSON line: {e}")
+                    continue
+
+            # Wait for process to complete
+            await proc.wait()
+
+            # Check for errors
+            if proc.returncode != 0:
+                stderr_data = await proc.stderr.read()
+                stderr_text = stderr_data.decode("utf-8") if stderr_data else ""
+                elapsed_ms = int((time.time() - start_time) * 1000)
+                error_msg = f"Claude Code CLI failed (exit {proc.returncode}): {stderr_text[:500]}"
+                logger.error(f"[PROVIDER] {error_msg}")
+                await self._emit_error_event(model, error_msg, elapsed_ms)
+                raise CLIProcessError(error_msg, proc.returncode)
+
+            # Store session ID for continuation
             if session_id:
                 self._last_session_id = session_id
 
             elapsed_ms = int((time.time() - start_time) * 1000)
 
-            # Emit success response event
+            # If we got a result but no content blocks, use result as text
+            if result_text and not content_blocks:
+                content_blocks.append(TextBlock(text=result_text))
+
+            # Emit success event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 await self.coordinator.hooks.emit(
                     "llm:response",
@@ -362,60 +562,101 @@ class ClaudeProvider:
                     },
                 )
 
-        except CLINotFoundError as e:
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            error_msg = (
-                "Claude Code CLI not found. Please install it: "
-                "curl -fsSL https://claude.ai/install.sh | bash"
+            return ChatResponse(
+                content=content_blocks if content_blocks else [TextBlock(text="")],
+                tool_calls=tool_calls if tool_calls else None,
+                usage=Usage(input_tokens=0, output_tokens=0, total_tokens=0),
+                finish_reason="end_turn",
             )
-            logger.error(f"[PROVIDER] {error_msg}")
-            await self._emit_error_event(model, error_msg, elapsed_ms)
-            raise RuntimeError(error_msg) from e
 
-        except CLIConnectionError as e:
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            error_msg = f"Claude Code connection error: {e}"
-            logger.error(f"[PROVIDER] {error_msg}")
-            await self._emit_error_event(model, error_msg, elapsed_ms)
-            raise RuntimeError(error_msg) from e
-
-        except ProcessError as e:
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            exit_code = getattr(e, "exit_code", "unknown")
-            error_msg = f"Claude Code process failed (exit code {exit_code}): {e}"
-            logger.error(f"[PROVIDER] {error_msg}")
-            await self._emit_error_event(model, error_msg, elapsed_ms)
-            raise RuntimeError(error_msg) from e
-
-        except CLIJSONDecodeError as e:
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            error_msg = f"Claude Code returned invalid JSON: {e}"
-            logger.error(f"[PROVIDER] {error_msg}")
-            await self._emit_error_event(model, error_msg, elapsed_ms)
-            raise RuntimeError(error_msg) from e
-
-        except ClaudeSDKError as e:
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            error_msg = f"Claude Code SDK error: {e}"
-            logger.error(f"[PROVIDER] {error_msg}")
-            await self._emit_error_event(model, error_msg, elapsed_ms)
-            raise RuntimeError(error_msg) from e
-
+        except asyncio.CancelledError:
+            logger.warning("[PROVIDER] CLI execution cancelled")
+            raise
+        except CLIProcessError:
+            raise
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
             error_msg = str(e) or f"{type(e).__name__}: (no message)"
-            logger.error(f"[PROVIDER] Claude Code error: {error_msg}")
+            logger.error(f"[PROVIDER] Claude Code CLI error: {error_msg}")
             await self._emit_error_event(model, error_msg, elapsed_ms)
-            raise
+            raise RuntimeError(f"Claude Code CLI error: {error_msg}") from e
 
-        # Build response
-        # Note: Claude Code doesn't expose token usage metrics
-        return ChatResponse(
-            content=content_blocks if content_blocks else [TextBlock(text="")],
-            tool_calls=tool_calls if tool_calls else None,
-            usage=Usage(input_tokens=0, output_tokens=0, total_tokens=0),
-            finish_reason="end_turn",
-        )
+    def _parse_message(self, msg: dict) -> dict | None:
+        """Parse a streaming JSON message from Claude Code CLI.
+
+        Message types:
+        - assistant: Contains content blocks (text, thinking, tool_use)
+        - result: Final result with session info
+        - system: System messages (init, etc.)
+
+        Args:
+            msg: Parsed JSON message
+
+        Returns:
+            Dict with extracted data, or None if not relevant
+        """
+        msg_type = msg.get("type")
+
+        if msg_type == "assistant":
+            # Assistant message with content blocks
+            message = msg.get("message", {})
+            content = message.get("content", [])
+
+            content_blocks = []
+            tool_calls = []
+
+            for block in content:
+                block_type = block.get("type")
+
+                if block_type == "text":
+                    content_blocks.append(TextBlock(text=block.get("text", "")))
+
+                elif block_type == "thinking":
+                    content_blocks.append(
+                        ThinkingBlock(
+                            thinking=block.get("thinking", ""),
+                            signature=block.get("signature"),
+                        )
+                    )
+
+                elif block_type == "tool_use":
+                    tool_id = block.get("id", "")
+                    tool_name = block.get("name", "")
+                    tool_input = block.get("input", {})
+
+                    content_blocks.append(
+                        ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)
+                    )
+                    tool_calls.append(
+                        ToolCall(id=tool_id, name=tool_name, arguments=tool_input)
+                    )
+
+            result = {}
+            if content_blocks:
+                result["content_blocks"] = content_blocks
+            if tool_calls:
+                result["tool_calls"] = tool_calls
+
+            # Extract session ID if present
+            if "session_id" in msg:
+                result["session_id"] = msg["session_id"]
+
+            return result if result else None
+
+        elif msg_type == "result":
+            # Final result message
+            result = {
+                "session_id": msg.get("session_id"),
+                "result": msg.get("result"),
+            }
+            return result
+
+        elif msg_type == "system":
+            # System messages (init, ready, etc.) - extract session ID
+            if "session_id" in msg:
+                return {"session_id": msg["session_id"]}
+
+        return None
 
     async def _emit_error_event(
         self, model: str, error_msg: str, elapsed_ms: int

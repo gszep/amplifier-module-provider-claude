@@ -1,11 +1,12 @@
 # Amplifier Claude Provider Module
 
-Claude model integration for Amplifier via Claude Code CLI.
+Claude model integration for Amplifier via direct Claude Code CLI integration.
 
 ## Prerequisites
 
 - **Python 3.11+**
 - **[UV](https://github.com/astral-sh/uv)** - Fast Python package manager
+- **Claude Code CLI** - Required for Claude Max subscription access
 
 ### Installing UV
 
@@ -17,205 +18,175 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
+### Installing Claude Code CLI
+
+```bash
+curl -fsSL https://claude.ai/install.sh | bash
+```
+
 ## Purpose
 
-Provides access to Anthropic's Claude models (Claude 4 series: Sonnet, Opus, Haiku) as an LLM provider for Amplifier.
+Provides access to Anthropic's Claude models (Sonnet, Opus, Haiku) via Claude Code CLI, enabling use of a **Claude Max subscription** instead of API billing.
+
+### Key Features
+
+- **No API key required** - Uses Claude Code's authentication (Claude Max subscription)
+- **Unlimited context size** - Bypasses ARG_MAX limits via file-based system prompts
+- **High throughput** - Stdin streaming for prompts, stdout streaming for responses
+- **Session continuity** - Continue/resume conversation sessions
+- **Zero SDK dependencies** - Direct CLI integration via subprocess
+
+## Architecture
+
+This provider bypasses the `claude-agent-sdk` limitations by using direct CLI invocation:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Amplifier Provider                                              │
+│                                                                  │
+│  1. System prompt → temp file (bypasses ARG_MAX)                │
+│  2. CLI: claude --system-prompt-file /tmp/xxx.txt               │
+│          --input-format stream-json                             │
+│  3. User prompt → stdin (NDJSON, unlimited size)                │
+│  4. Response ← stdout (stream-json parsing)                     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Why Direct CLI?
+
+The `claude-agent-sdk` passes system prompts as CLI arguments, hitting OS ARG_MAX limits (~500KB). For agentic tools with large context windows, this is a blocker.
+
+| Approach | System Prompt Limit | User Prompt Limit |
+|----------|--------------------|--------------------|
+| `claude-agent-sdk` | ~500 KB (ARG_MAX) | ~500 KB (ARG_MAX) |
+| **Direct CLI** | **Unlimited** (file) | **Unlimited** (stdin) |
 
 ## Contract
 
-**Module Type:** Provider
-**Mount Point:** `providers`
+**Module Type:** Provider  
+**Mount Point:** `providers`  
 **Entry Point:** `amplifier_module_provider_claude:mount`
 
 ## Supported Models
 
-- `claude-sonnet-4-5` - Claude Sonnet 4.5 (recommended, default)
-- `claude-opus-4-1` - Claude Opus 4.1 (most capable)
-- `claude-haiku-4-5` - Claude Haiku 4.5 (fastest, cheapest)
+- `sonnet` - Claude Sonnet (recommended, default)
+- `opus` - Claude Opus (most capable, extended thinking)
+- `haiku` - Claude Haiku (fastest)
 
 ## Configuration
 
-```toml
-[[providers]]
-module = "provider-claude"
-name = "claude"
-config = {
-    default_model = "claude-sonnet-4-5",
-    max_tokens = 8192,
-    temperature = 1.0,
-    debug = false,      # Enable standard debug events
-    raw_debug = false   # Enable ultra-verbose raw API I/O logging
-}
-```
-
-### Debug Configuration
-
-**Standard Debug** (`debug: true`):
-- Emits `llm:request:debug` and `llm:response:debug` events
-- Contains request/response summaries with message counts, model info, usage stats
-- Moderate log volume, suitable for development
-
-**Raw Debug** (`debug: true, raw_debug: true`):
-- Emits `llm:request:raw` and `llm:response:raw` events
-- Contains complete, unmodified request params and response objects
-- Extreme log volume, use only for deep provider integration debugging
-- Captures the exact data sent to/from Anthropic API before any processing
-
-**Example**:
 ```yaml
 providers:
   - module: provider-claude
+    name: claude
     config:
-      debug: true      # Enable debug events
-      raw_debug: true  # Enable raw API I/O capture
-      default_model: claude-sonnet-4-5
+      default_model: sonnet
+      max_turns: 1
+      debug: false
+      # Optional: working directory for sessions
+      cwd: /path/to/project
+      # Optional: permission mode (default, plan, acceptEdits, bypassPermissions)
+      permission_mode: default
+      # Optional: auto-continue previous session
+      auto_continue: false
 ```
 
-### Rate Limit Configuration
+### Tool Configuration
 
-The provider uses the Anthropic SDK's built-in retry mechanism for rate limit errors (429) and server errors (5xx). Configure retry behavior:
+Control which Claude Code built-in tools are available:
 
 ```yaml
 providers:
   - module: provider-claude
     config:
-      max_retries: 5  # Number of retry attempts (default: 2)
+      allowed_tools:
+        - Read
+        - Write
+        - Edit
+        - Bash
+        - Grep
+        - Glob
+      disallowed_tools:
+        - WebSearch
+        - WebFetch
 ```
 
-**Behavior:**
-- SDK automatically retries 429 (rate limit) and 5xx errors with exponential backoff
-- Default is 2 retries (SDK default)
-- Set to `0` to disable retries
-- When retries are exhausted, emits `anthropic:rate_limited` event with retry timing info
+### Available Built-in Tools
 
-**Events emitted on rate limit:**
-- `anthropic:rate_limited` - Detailed rate limit info including `retry_after_seconds`
-- `llm:response` with `status: "rate_limited"` - Standard error event
-
-## Beta Headers
-
-Anthropic provides experimental features through beta headers. Enable these features by adding the `beta_headers` configuration field.
-
-### Configuration
-
-**Single beta header:**
-```yaml
-providers:
-  - module: provider-claude
-    config:
-      default_model: claude-sonnet-4-5
-      beta_headers: "context-1m-2025-08-07"  # Enable 1M token context window
-```
-
-**Multiple beta headers:**
-```yaml
-providers:
-  - module: provider-claude
-    config:
-      default_model: claude-sonnet-4-5
-      beta_headers:
-        - "context-1m-2025-08-07"
-        - "future-feature-header"
-```
-
-### 1M Token Context Window
-
-Claude Sonnet 4.5 supports a 1M token context window when the `context-1m-2025-08-07` beta header is enabled:
-
-```yaml
-providers:
-  - module: provider-claude
-    config:
-      default_model: claude-sonnet-4-5
-      beta_headers: "context-1m-2025-08-07"
-      max_tokens: 8192  # Output tokens remain separate from context window
-```
-
-With this configuration:
-- **Context window**: Up to 1M tokens of input (messages, tools, system prompt)
-- **Output tokens**: Controlled by `max_tokens` (separate from context window)
-- **Use case**: Process large codebases, extensive documentation, or long conversation histories
-
-### Notes
-
-- Beta features are experimental and subject to change
-- Check [Anthropic's documentation](https://docs.anthropic.com) for available beta headers
-- Beta headers are optional - existing configurations work unchanged
-- Invalid beta headers will cause API errors (fail fast)
-- Beta header usage is logged at initialization for observability
-
-## Environment Variables
-
-```bash
-export ANTHROPIC_API_KEY="your-api-key-here"
-```
+| Tool | Description |
+|------|-------------|
+| `Read` | Read file contents |
+| `Write` | Write file contents |
+| `Edit` | Edit file contents |
+| `MultiEdit` | Edit multiple files |
+| `Bash` | Execute shell commands |
+| `Glob` | Find files by pattern |
+| `Grep` | Search file contents |
+| `LS` | List directory contents |
+| `WebFetch` | Fetch web content |
+| `WebSearch` | Search the web |
+| `Task` | Delegate to sub-agents |
+| `TodoRead` | Read todo list |
+| `TodoWrite` | Write todo list |
+| `NotebookRead` | Read Jupyter notebooks |
+| `NotebookEdit` | Edit Jupyter notebooks |
 
 ## Usage
 
 ```python
 # In amplifier configuration
-[provider]
-name = "claude"
-default_model = "claude-sonnet-4-5"
+providers:
+  - module: provider-claude
+    name: claude
+    config:
+      default_model: sonnet
+```
+
+### Session Continuity
+
+Continue a previous session:
+
+```python
+response = await provider.complete(
+    request,
+    continue_session=True,  # Continue last session in cwd
+)
+
+# Or resume a specific session:
+response = await provider.complete(
+    request,
+    session_id="session-uuid-here",
+)
 ```
 
 ## Features
 
-- Streaming support
-- Tool use (function calling)
-- Vision capabilities (on supported models)
-- Token counting and management
-- **Message validation** before API calls (defense in depth)
-
-## Graceful Error Recovery
-
-The provider implements automatic repair for incomplete tool call sequences:
-
-**The Problem**: If tool results are missing from conversation history (due to context compaction bugs, parsing errors, or state corruption), the Anthropic API rejects the entire request, breaking the user's session.
-
-**The Solution**: The provider automatically detects and repairs missing tool_results by injecting synthetic results:
-
-1. **Repair before validation** - Detects missing tool_results and injects synthetic ones
-2. **Make failures visible** - Synthetic results contain `[SYSTEM ERROR: Tool result missing]` messages
-3. **Maintain conversation validity** - API accepts repaired messages, session continues
-4. **Enable recovery** - LLM acknowledges error and can ask user to retry
-5. **Provide observability** - Emits `provider:tool_sequence_repaired` event with repair details
-6. **Validate remaining** - After repair, strict validation catches any remaining inconsistencies
-
-**Example**:
-```python
-# Anthropic format (after _convert_messages)
-messages = [
-    {
-        "role": "assistant",
-        "content": [
-            {"type": "tool_use", "id": "toolu_123", "name": "get_weather", "input": {...}}
-        ]
-    },
-    # MISSING: {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_123", ...}]}
-    {"role": "user", "content": "Thanks"}
-]
-
-# Provider repairs by injecting synthetic result:
-# Either appends to existing user message or inserts new one
-{
-    "role": "user",
-    "content": [{
-        "type": "tool_result",
-        "tool_use_id": "toolu_123",
-        "content": "[SYSTEM ERROR: Tool result missing]\n\nTool: get_weather\n..."
-    }]
-}
-```
-
-**Observability**: Repairs are logged as warnings and emit `provider:tool_sequence_repaired` events for monitoring.
-
-**Philosophy**: This is **graceful degradation** following kernel philosophy - errors in other modules (context management) don't crash the provider or kill the user's session
+- **Streaming support** - Real-time response streaming
+- **Tool use** - Full tool calling support with automatic mapping
+- **Extended thinking** - Supported on Opus model
+- **Session management** - Continue/resume conversations
+- **Unlimited context** - No ARG_MAX limitations
 
 ## Dependencies
 
 - `amplifier-core>=1.0.0`
-- `anthropic>=0.25.0`
+- Claude Code CLI (installed separately)
+
+**No Python SDK dependencies** - This provider uses direct subprocess communication.
+
+## Events
+
+The provider emits standard Amplifier events:
+
+- `llm:request` - Before CLI invocation (includes system_prompt_bytes for monitoring)
+- `llm:response` - After successful response (includes session_id for continuity)
+
+## Error Handling
+
+| Error | Cause | Resolution |
+|-------|-------|------------|
+| `CLINotFoundError` | Claude Code CLI not installed | Run install script |
+| `CLIProcessError` | CLI returned non-zero exit | Check stderr output |
 
 ## Contributing
 
