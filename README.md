@@ -20,10 +20,10 @@ curl -fsSL https://claude.ai/install.sh | bash
 amplifier module add provider-claude --source git+https://github.com/gszep/amplifier-module-provider-claude@main
 ```
 
-### 3. Use It
+### 3. Configure it to be the default
 
 ```bash
-amplifier run --provider claude "Hello, Claude!"
+amplifier init
 ```
 
 > **Note**: If `ANTHROPIC_API_KEY` is set, Amplifier prefers direct API access. Remove it from `~/.amplifier/keys.env` to use your subscription.
