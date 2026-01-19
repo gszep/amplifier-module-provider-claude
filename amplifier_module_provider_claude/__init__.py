@@ -418,7 +418,7 @@ class ClaudeProvider:
         # Combine system prompt and user prompt for stdin
         # System instructions go first, then the user's actual request
         if system_prompt:
-            full_prompt = f"{system_prompt}\n\n---\n\nUser request:\n{user_prompt}"
+            full_prompt = f"{system_prompt}\n\n{user_prompt}"
         else:
             full_prompt = user_prompt
 
@@ -514,26 +514,26 @@ class ClaudeProvider:
             if role == "system":
                 # Skip system messages when resuming - already cached by Claude CLI
                 if not resuming:
-                    system_parts.append(content)
+                    system_parts.append(f"<system-reminder>{content}</system-reminder>")
 
             elif role == "user":
-                conversation_parts.append(f"Human: {content}")
+                conversation_parts.append(f"<user>{content}</user>")
 
             elif role == "assistant":
                 # Check for tool calls in assistant message
                 assistant_content = self._format_assistant_message(msg)
-                conversation_parts.append(f"Assistant: {assistant_content}")
+                conversation_parts.append(f"<assistant>{assistant_content}</assistant>")
 
             elif role == "tool":
                 # Tool result - format for Claude
                 tool_result = self._format_tool_result(msg)
-                conversation_parts.append(f"Human: {tool_result}")
+                conversation_parts.append(f"{tool_result}")
 
             elif role == "developer":
                 # Developer messages contain context files (like @mentions)
                 # Wrap in <context_file> tags following Anthropic provider pattern
                 wrapped = f"<context_file>\n{content}\n</context_file>"
-                conversation_parts.append(f"Human: {wrapped}")
+                conversation_parts.append(f"{wrapped}")
 
         # Build final prompts
         system_prompt = "\n\n".join(system_parts) if system_parts else ""
@@ -722,10 +722,18 @@ class ClaudeProvider:
             return ""
 
         tools_json = json.dumps(tools, indent=2)
+        tool_use_example = json.dumps(
+            {
+                "tool": "tool_name",
+                "id": "unique_id",
+                "input": {"param1": "value1"},
+            }
+        )
 
         return f"""You have access to the following tools:
-
+<tools>
 {tools_json}
+</tools>
 
 CRITICAL - Follow the input_schema exactly:
 - For "enum" fields, ONLY use values listed in the enum array
@@ -734,7 +742,7 @@ CRITICAL - Follow the input_schema exactly:
 
 To use a tool, output a tool_use block in this exact format:
 <tool_use>
-{{"tool": "tool_name", "id": "unique_id", "input": {{"param1": "value1"}}}}
+{tool_use_example}
 </tool_use>
 
 Important:
