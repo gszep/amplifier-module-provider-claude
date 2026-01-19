@@ -175,6 +175,11 @@ class ClaudeProvider:
             self.config.get("max_thinking_tokens", DEFAULT_MAX_THINKING_TOKENS),
         )
 
+        # Track tool call IDs that have been repaired with synthetic results.
+        # This prevents infinite loops when the same missing tool results are
+        # detected repeatedly across LLM iterations.
+        self._repaired_tool_ids: set[str] = set()
+
     def get_info(self) -> ProviderInfo:
         """Return provider information.
 
@@ -226,6 +231,80 @@ class ClaudeProvider:
             List of ToolCall objects.
         """
         return response.tool_calls or []
+
+    # -------------------------------------------------------------------------
+    # Tool result validation and repair
+    # -------------------------------------------------------------------------
+
+    def _find_missing_tool_results(
+        self, messages: list[Message]
+    ) -> list[tuple[int, str, str, dict]]:
+        """Find tool calls without matching results.
+
+        Scans conversation for assistant tool calls and validates each has
+        a corresponding tool result message. Returns missing pairs WITH their
+        source message index so they can be inserted in the correct position.
+
+        Excludes tool call IDs that have already been repaired with synthetic
+        results to prevent infinite detection loops.
+
+        Returns:
+            List of (msg_index, call_id, tool_name, tool_args) tuples for unpaired calls.
+            msg_index is the index of the assistant message containing the tool call.
+        """
+        tool_calls: dict[
+            str, tuple[int, str, dict]
+        ] = {}  # {call_id: (msg_index, name, args)}
+        tool_results: set[str] = set()  # {call_id}
+
+        for idx, msg in enumerate(messages):
+            # Check assistant messages for ToolCallBlock in content
+            if msg.role == "assistant" and isinstance(msg.content, list):
+                for block in msg.content:
+                    # Handle ToolCallBlock from amplifier_core
+                    if hasattr(block, "type") and hasattr(block, "id"):
+                        block_type = getattr(block, "type", None)
+                        if block_type == "tool_call":
+                            block_id = getattr(block, "id", None)
+                            block_name = getattr(block, "name", "")
+                            block_input = getattr(block, "input", {})
+                            if block_id:
+                                tool_calls[block_id] = (idx, block_name, block_input)
+
+            # Check tool messages for tool_call_id
+            elif (
+                msg.role == "tool" and hasattr(msg, "tool_call_id") and msg.tool_call_id
+            ):
+                tool_results.add(msg.tool_call_id)
+
+        # Exclude IDs that have already been repaired to prevent infinite loops
+        return [
+            (msg_idx, call_id, name, args)
+            for call_id, (msg_idx, name, args) in tool_calls.items()
+            if call_id not in tool_results and call_id not in self._repaired_tool_ids
+        ]
+
+    def _create_synthetic_result(self, call_id: str, tool_name: str) -> Message:
+        """Create synthetic error result for missing tool response.
+
+        This is a BACKUP for when tool results go missing AFTER execution.
+        The orchestrator should handle tool execution errors at runtime,
+        so this should only trigger on context/parsing bugs.
+        """
+        return Message(
+            role="tool",
+            content=(
+                f"[SYSTEM ERROR: Tool result missing from conversation history]\n\n"
+                f"Tool: {tool_name}\n"
+                f"Call ID: {call_id}\n\n"
+                f"This indicates the tool result was lost after execution.\n"
+                f"Likely causes: context compaction bug, message parsing error, or state corruption.\n\n"
+                f"The tool may have executed successfully, but the result was lost.\n"
+                f"Please acknowledge this error and offer to retry the operation."
+            ),
+            tool_call_id=call_id,
+            name=tool_name,
+        )
 
     # -------------------------------------------------------------------------
     # Main completion method
@@ -801,6 +880,15 @@ Important:
         matches = re.findall(pattern, text, re.DOTALL)
 
         for match in matches:
+            # Skip if content doesn't look like JSON (e.g., documentation text about tool_use)
+            stripped = match.strip()
+            if not stripped.startswith("{"):
+                logger.debug(
+                    f"[PROVIDER] Skipping non-JSON content in tool_use block: "
+                    f"{stripped[:50]}..."
+                )
+                continue
+
             try:
                 tool_data = json.loads(match)
                 tool_call = {
@@ -809,8 +897,11 @@ Important:
                     "arguments": tool_data.get("input", tool_data.get("arguments", {})),
                 }
                 tool_calls.append(tool_call)
-            except json.JSONDecodeError:
-                logger.warning(f"[PROVIDER] Failed to parse tool call: {match[:100]}")
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    f"[PROVIDER] Failed to parse tool call JSON: {e}. "
+                    f"Content: {match[:200]}"
+                )
                 continue
 
         return tool_calls
