@@ -381,10 +381,12 @@ class ClaudeProvider:
         # Check for existing session to resume
         request_metadata = getattr(request, "metadata", None) or {}
         existing_session_id = request_metadata.get(METADATA_SESSION_ID)
+        resuming = existing_session_id is not None
 
         # Convert messages to CLI format
+        # When resuming, Claude CLI has cached history - only send current turn
         system_prompt, user_prompt = self._convert_messages(
-            request.messages, request.tools
+            request.messages, request.tools, resuming=resuming
         )
 
         # Build command (without system prompt - passed via stdin to avoid ARG_MAX)
@@ -456,13 +458,17 @@ class ClaudeProvider:
     # -------------------------------------------------------------------------
 
     def _convert_messages(
-        self, messages: list[Message], tools: list[Any] | None
+        self,
+        messages: list[Message],
+        tools: list[Any] | None,
+        resuming: bool = False,
     ) -> tuple[str, str]:
         """Convert Amplifier messages to Claude CLI format.
 
         Args:
             messages: List of Amplifier Message objects.
             tools: List of tool specifications.
+            resuming: If True, only include current turn (Claude CLI has cached history).
 
         Returns:
             Tuple of (system_prompt, user_prompt).
@@ -470,10 +476,16 @@ class ClaudeProvider:
         system_parts = []
         conversation_parts = []
 
-        # Build tool definitions for system prompt
-        if tools:
-            tool_definitions = self._convert_tools(tools)
-            system_parts.append(self._build_tool_instructions(tool_definitions))
+        # When resuming, only process current turn messages
+        # Claude CLI caches conversation history, so we only need new content
+        if resuming:
+            messages = self._get_current_turn_messages(messages)
+            # Skip system prompt and tool definitions - already cached by Claude CLI
+        else:
+            # Build tool definitions for system prompt (first call only)
+            if tools:
+                tool_definitions = self._convert_tools(tools)
+                system_parts.append(self._build_tool_instructions(tool_definitions))
 
         # Process messages
         for msg in messages:
@@ -481,7 +493,9 @@ class ClaudeProvider:
             content = self._extract_content(msg)
 
             if role == "system":
-                system_parts.append(content)
+                # Skip system messages when resuming - already cached by Claude CLI
+                if not resuming:
+                    system_parts.append(content)
 
             elif role == "user":
                 conversation_parts.append(f"Human: {content}")
@@ -514,6 +528,36 @@ class ClaudeProvider:
             user_prompt = self._extract_content(messages[0])
 
         return system_prompt, user_prompt
+
+    def _get_current_turn_messages(self, messages: list[Message]) -> list[Message]:
+        """Get only messages from the current turn (after last assistant response).
+
+        When resuming a Claude CLI session, the CLI has the conversation history
+        cached. We only need to send:
+        - Tool results from the current turn (after the last assistant message)
+        - Any new user message
+
+        Args:
+            messages: Full list of conversation messages.
+
+        Returns:
+            Messages from the current turn only.
+        """
+        # Find the last assistant message index
+        last_assistant_idx = -1
+        for i, msg in enumerate(messages):
+            if msg.role == "assistant":
+                last_assistant_idx = i
+
+        if last_assistant_idx == -1:
+            # No assistant message yet - this is first turn, return all
+            return messages
+
+        # Return everything after the last assistant message
+        # This includes tool results and any new user/developer messages
+        current_turn = messages[last_assistant_idx + 1 :]
+
+        return current_turn
 
     def _extract_content(self, msg: Message) -> str:
         """Extract text content from a message.
