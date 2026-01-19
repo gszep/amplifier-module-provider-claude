@@ -30,7 +30,6 @@ from amplifier_core.events import (  # type: ignore
     CONTENT_BLOCK_END,
     CONTENT_BLOCK_START,
 )
-
 from amplifier_core.message_models import (  # type: ignore
     ChatRequest,
     ChatResponse,
@@ -150,7 +149,7 @@ class ClaudeProvider:
     """
 
     name = "claude"
-    api_label = "Claude (Claude Code)"
+    api_label = "Claude Code"
 
     def __init__(
         self,
@@ -188,7 +187,7 @@ class ClaudeProvider:
         """
         return ProviderInfo(
             id="claude",
-            display_name="Claude (Claude Code)",
+            display_name="Claude Code",
             credential_env_vars=[],  # No API key needed - uses Claude Code auth
             capabilities=["streaming", "tools", "thinking"],
             defaults={
@@ -223,14 +222,34 @@ class ClaudeProvider:
         """Parse tool calls from response.
 
         Tool calls are extracted in complete() and placed in response.tool_calls.
+        Filters out tool calls with empty/missing arguments to handle
+        Claude API quirk where empty tool_use blocks are sometimes generated.
 
         Args:
             response: The ChatResponse to extract tool calls from.
 
         Returns:
-            List of ToolCall objects.
+            List of valid tool calls (with non-empty arguments).
         """
-        return response.tool_calls or []
+        if not response.tool_calls:
+            return []
+
+        # Filter out tool calls with empty arguments (Claude API quirk)
+        # Claude sometimes generates tool_use blocks with empty input {}
+        valid_calls = []
+        for tc in response.tool_calls:
+            # Skip tool calls with no arguments or empty dict
+            if not tc.arguments:
+                logger.debug(f"Filtering out tool '{tc.name}' with empty arguments")
+                continue
+            valid_calls.append(tc)
+
+        if len(valid_calls) < len(response.tool_calls):
+            logger.info(
+                f"Filtered {len(response.tool_calls) - len(valid_calls)} tool calls with empty arguments"
+            )
+
+        return valid_calls
 
     # -------------------------------------------------------------------------
     # Tool result validation and repair
@@ -738,6 +757,8 @@ Important:
         """Build the CLI command.
 
         Note: System prompt is passed via stdin to avoid ARG_MAX limits.
+        The --system-prompt arg overrides Claude's default persona with
+        an Amplifier-specific role description.
 
         Args:
             cli_path: Path to the claude CLI.
@@ -760,10 +781,27 @@ Important:
             "",  # Disable ALL built-in tools - we provide our own
         ]
 
-        # Add session resumption if we have an existing session
+        # Add session resumption OR system prompt (mutually exclusive)
+        # When resuming, Claude CLI has cached context including original system prompt
         if session_id:
             cmd.extend(["--resume", session_id])
             logger.info(f"[PROVIDER] Resuming Claude session: {session_id}")
+        else:
+            # First call - override Claude's default persona with Amplifier role
+            amplifier_role = """<role>
+You are an AI assistant integrated with Amplifier, a modular AI agent framework.
+You operate as a provider within Amplifier's orchestration system.
+
+Your role:
+- Execute tasks delegated by Amplifier's orchestrator
+- Use the provided tools to accomplish user goals
+- Return structured responses that Amplifier can process
+- Follow tool schemas exactly as specified
+
+Amplifier handles tool execution externally - you decide which tools to call,
+but the orchestrator executes them and returns results to you.
+</role>"""
+            cmd.extend(["--system-prompt", amplifier_role])
 
         # Enable extended thinking for models that support it
         if self.max_thinking_tokens > 0:
@@ -805,115 +843,126 @@ Important:
 
         assert proc.stdout is not None
 
-        async for line in proc.stdout:
-            line_str = line.decode("utf-8").strip()
-            if not line_str:
-                continue
+        # Read in chunks to handle large JSON lines (thinking blocks can exceed 64KB)
+        # The default asyncio StreamReader limit is 64KB which is too small
+        buffer = b""
+        while True:
+            chunk = await proc.stdout.read(1024 * 1024)  # 1MB chunks
+            if not chunk:
+                break
+            buffer += chunk
 
-            try:
-                event_data = json.loads(line_str)
-            except json.JSONDecodeError:
-                if self.debug:
-                    logger.warning(f"[PROVIDER] Failed to parse: {line_str[:100]}")
-                continue
+            # Process complete lines from buffer
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                line_str = line.decode("utf-8").strip()
+                if not line_str:
+                    continue
 
-            event_type = event_data.get("type")
+                try:
+                    event_data = json.loads(line_str)
+                except json.JSONDecodeError:
+                    if self.debug:
+                        logger.warning(f"[PROVIDER] Failed to parse: {line_str[:100]}")
+                    continue
 
-            # Handle assistant messages - extract content blocks directly
-            if event_type == "assistant":
-                message = event_data.get("message", {})
-                content_blocks = message.get("content", [])
+                event_type = event_data.get("type")
 
-                for block in content_blocks:
-                    block_type = block.get("type")
+                # Handle assistant messages - extract content blocks directly
+                if event_type == "assistant":
+                    message = event_data.get("message", {})
+                    content_blocks = message.get("content", [])
 
-                    if block_type == "thinking":
-                        # Extract thinking content and signature
-                        thinking_text = block.get("thinking", "")
-                        thinking_signature = block.get("signature", "")
-                        logger.debug(
-                            f"[PROVIDER] Thinking block: {len(thinking_text)} chars"
-                        )
+                    for block in content_blocks:
+                        block_type = block.get("type")
 
-                        # Emit streaming events for thinking block
-                        await self._emit_event(
-                            CONTENT_BLOCK_START,
-                            {
-                                "index": block_index,
-                                "content_block": ThinkingBlock(
-                                    thinking="",
-                                    signature=thinking_signature,
-                                ),
-                            },
-                        )
-                        await self._emit_event(
-                            CONTENT_BLOCK_DELTA,
-                            {
-                                "index": block_index,
-                                "delta": ThinkingBlock(
-                                    thinking=thinking_text,
-                                    signature=thinking_signature,
-                                ),
-                            },
-                        )
-                        await self._emit_event(
-                            CONTENT_BLOCK_END,
-                            {
-                                "index": block_index,
-                                "content_block": ThinkingBlock(
-                                    thinking=thinking_text,
-                                    signature=thinking_signature,
-                                ),
-                            },
-                        )
-                        block_index += 1
+                        if block_type == "thinking":
+                            # Extract thinking content and signature
+                            thinking_text = block.get("thinking", "")
+                            thinking_signature = block.get("signature", "")
+                            logger.debug(
+                                f"[PROVIDER] Thinking block: {len(thinking_text)} chars"
+                            )
 
-                    elif block_type == "text":
-                        # Accumulate text content (multiple text blocks can appear)
-                        text_content = block.get("text", "")
-                        if response_text and text_content:
-                            response_text += "\n" + text_content
-                        else:
-                            response_text += text_content
-
-                        # Emit streaming events for text block
-                        await self._emit_event(
-                            CONTENT_BLOCK_START,
-                            {
-                                "index": block_index,
-                                "content_block": {"type": "text"},
-                            },
-                        )
-                        await self._emit_event(
-                            CONTENT_BLOCK_DELTA,
-                            {
-                                "index": block_index,
-                                "delta": {
-                                    "type": "text_delta",
-                                    "text": text_content,  # Current block only, not accumulated
+                            # Emit streaming events for thinking block
+                            await self._emit_event(
+                                CONTENT_BLOCK_START,
+                                {
+                                    "index": block_index,
+                                    "content_block": ThinkingBlock(
+                                        thinking="",
+                                        signature=thinking_signature,
+                                    ),
                                 },
-                            },
-                        )
-                        await self._emit_event(
-                            CONTENT_BLOCK_END,
-                            {"index": block_index},
-                        )
-                        block_index += 1
+                            )
+                            await self._emit_event(
+                                CONTENT_BLOCK_DELTA,
+                                {
+                                    "index": block_index,
+                                    "delta": ThinkingBlock(
+                                        thinking=thinking_text,
+                                        signature=thinking_signature,
+                                    ),
+                                },
+                            )
+                            await self._emit_event(
+                                CONTENT_BLOCK_END,
+                                {
+                                    "index": block_index,
+                                    "content_block": ThinkingBlock(
+                                        thinking=thinking_text,
+                                        signature=thinking_signature,
+                                    ),
+                                },
+                            )
+                            block_index += 1
 
-            # Handle final result
-            elif event_type == "result":
-                # Use result text as fallback
-                if not response_text:
-                    response_text = event_data.get("result", "")
+                        elif block_type == "text":
+                            # Accumulate text content (multiple text blocks can appear)
+                            text_content = block.get("text", "")
+                            if response_text and text_content:
+                                response_text += "\n" + text_content
+                            else:
+                                response_text += text_content
 
-                usage_data = event_data.get("usage", {})
-                session_id = event_data.get("session_id")
-                metadata = {
-                    METADATA_SESSION_ID: session_id,
-                    METADATA_DURATION_MS: event_data.get("duration_ms"),
-                    METADATA_COST_USD: event_data.get("total_cost_usd"),
-                    "num_turns": event_data.get("num_turns"),
-                }
+                            # Emit streaming events for text block
+                            await self._emit_event(
+                                CONTENT_BLOCK_START,
+                                {
+                                    "index": block_index,
+                                    "content_block": {"type": "text"},
+                                },
+                            )
+                            await self._emit_event(
+                                CONTENT_BLOCK_DELTA,
+                                {
+                                    "index": block_index,
+                                    "delta": {
+                                        "type": "text_delta",
+                                        "text": text_content,
+                                    },
+                                },
+                            )
+                            await self._emit_event(
+                                CONTENT_BLOCK_END,
+                                {"index": block_index},
+                            )
+                            block_index += 1
+
+                # Handle final result
+                elif event_type == "result":
+                    # Use result text as fallback
+                    if not response_text:
+                        response_text = event_data.get("result", "")
+
+                    usage_data = event_data.get("usage", {})
+                    session_id = event_data.get("session_id")
+                    metadata = {
+                        METADATA_SESSION_ID: session_id,
+                        METADATA_DURATION_MS: event_data.get("duration_ms"),
+                        METADATA_COST_USD: event_data.get("total_cost_usd"),
+                        "num_turns": event_data.get("num_turns"),
+                    }
 
         # Wait for process to complete
         await proc.wait()
