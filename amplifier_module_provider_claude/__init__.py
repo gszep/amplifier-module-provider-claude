@@ -723,7 +723,7 @@ Important:
                                 "index": block_index,
                                 "delta": {
                                     "type": "text_delta",
-                                    "text": response_text,
+                                    "text": text_content,  # Current block only, not accumulated
                                 },
                             },
                         )
