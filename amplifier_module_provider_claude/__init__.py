@@ -379,6 +379,12 @@ class ClaudeProvider:
                 tool_result = self._format_tool_result(msg)
                 conversation_parts.append(f"Human: {tool_result}")
 
+            elif role == "developer":
+                # Developer messages contain context files (like @mentions)
+                # Wrap in <context_file> tags following Anthropic provider pattern
+                wrapped = f"<context_file>\n{content}\n</context_file>"
+                conversation_parts.append(f"Human: {wrapped}")
+
         # Build final prompts
         system_prompt = "\n\n".join(system_parts) if system_parts else ""
 
