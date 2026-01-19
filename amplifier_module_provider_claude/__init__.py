@@ -921,10 +921,16 @@ Important:
         if proc.returncode != 0:
             stderr_data = await proc.stderr.read() if proc.stderr else b""
             error_msg = stderr_data.decode("utf-8").strip()
-            logger.error(f"[PROVIDER] CLI failed: {error_msg}")
-            raise RuntimeError(
-                f"Claude Code CLI failed (exit {proc.returncode}): {error_msg}"
-            )
+
+            if error_msg != "":
+                logger.error(f"[PROVIDER] CLI failed: {error_msg}")
+                raise RuntimeError(
+                    f"Claude Code CLI failed (exit {proc.returncode}): {error_msg}"
+                )
+            else:
+                raise RuntimeError(
+                    f"Claude Code CLI failed (exit {proc.returncode}): Subscription limits may have been exceeded. Visit https://claude.ai/settings/usage."
+                )
 
         # Parse tool calls from response text
         tool_calls = self._extract_tool_calls(response_text)
