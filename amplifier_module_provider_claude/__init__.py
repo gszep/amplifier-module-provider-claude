@@ -249,27 +249,18 @@ class ClaudeProvider:
         results to prevent infinite detection loops.
 
         Returns:
-            List of (msg_index, call_id, tool_name, tool_args) tuples for unpaired calls.
-            msg_index is the index of the assistant message containing the tool call.
+            List of (msg_index, call_id, tool_name, tool_arguments) tuples for unpaired calls.
+            msg_index is the index of the assistant message containing the tool_use block.
         """
-        tool_calls: dict[
-            str, tuple[int, str, dict]
-        ] = {}  # {call_id: (msg_index, name, args)}
-        tool_results: set[str] = set()  # {call_id}
+        tool_calls = {}  # {call_id: (msg_index, name, args)}
+        tool_results = set()  # {call_id}
 
         for idx, msg in enumerate(messages):
             # Check assistant messages for ToolCallBlock in content
             if msg.role == "assistant" and isinstance(msg.content, list):
                 for block in msg.content:
-                    # Handle ToolCallBlock from amplifier_core
-                    if hasattr(block, "type") and hasattr(block, "id"):
-                        block_type = getattr(block, "type", None)
-                        if block_type == "tool_call":
-                            block_id = getattr(block, "id", None)
-                            block_name = getattr(block, "name", "")
-                            block_input = getattr(block, "input", {})
-                            if block_id:
-                                tool_calls[block_id] = (idx, block_name, block_input)
+                    if hasattr(block, "type") and block.type == "tool_call":
+                        tool_calls[block.id] = (idx, block.name, block.input)
 
             # Check tool messages for tool_call_id
             elif (
@@ -325,6 +316,53 @@ class ClaudeProvider:
         Raises:
             RuntimeError: If CLI is not found or fails.
         """
+        # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
+        missing = self._find_missing_tool_results(request.messages)
+
+        if missing:
+            logger.warning(
+                f"[PROVIDER] Claude: Detected {len(missing)} missing tool result(s). "
+                f"Injecting synthetic errors. This indicates a bug in context management. "
+                f"Tool IDs: {[call_id for _, call_id, _, _ in missing]}"
+            )
+
+            # Group missing results by source assistant message index
+            # We need to insert synthetic results IMMEDIATELY after each assistant message
+            # that contains tool_use blocks (not at the end of the list)
+            from collections import defaultdict
+
+            by_msg_idx: dict[int, list[tuple[str, str]]] = defaultdict(list)
+            for msg_idx, call_id, tool_name, _ in missing:
+                by_msg_idx[msg_idx].append((call_id, tool_name))
+
+            # Insert synthetic results in reverse order of message index
+            # (so earlier insertions don't shift later indices)
+            for msg_idx in sorted(by_msg_idx.keys(), reverse=True):
+                synthetics = []
+                for call_id, tool_name in by_msg_idx[msg_idx]:
+                    synthetics.append(self._create_synthetic_result(call_id, tool_name))
+                    # Track this ID so we don't detect it as missing again in future iterations
+                    self._repaired_tool_ids.add(call_id)
+
+                # Insert all synthetic results immediately after the assistant message
+                insert_pos = msg_idx + 1
+                for i, synthetic in enumerate(synthetics):
+                    request.messages.insert(insert_pos + i, synthetic)
+
+            # Emit observability event
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "provider:tool_sequence_repaired",
+                    {
+                        "provider": self.name,
+                        "repair_count": len(missing),
+                        "repairs": [
+                            {"tool_call_id": call_id, "tool_name": tool_name}
+                            for _, call_id, tool_name, _ in missing
+                        ],
+                    },
+                )
+
         start_time = time.time()
 
         # Find CLI
@@ -521,7 +559,7 @@ class ClaudeProvider:
                 if hasattr(block, "type"):
                     if block.type == "text":
                         parts.append(block.text)
-                    elif block.type == "tool_use":
+                    elif block.type in ("tool_use", "tool_call"):
                         # Format tool call for conversation history
                         tool_call_str = json.dumps(
                             {
@@ -534,7 +572,7 @@ class ClaudeProvider:
                 elif isinstance(block, dict):
                     if block.get("type") == "text":
                         parts.append(block.get("text", ""))
-                    elif block.get("type") == "tool_use":
+                    elif block.get("type") in ("tool_use", "tool_call"):
                         tool_call_str = json.dumps(
                             {
                                 "tool": block.get("name"),
