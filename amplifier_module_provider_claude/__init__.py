@@ -1085,11 +1085,19 @@ Important:
         cache_creation = usage_data.get("cache_creation_input_tokens", 0)
         total_input = input_tokens + cache_read + cache_creation
 
-        usage = Usage(
-            input_tokens=total_input,
-            output_tokens=output_tokens,
-            total_tokens=total_input + output_tokens,
-        )
+        # Build usage dict with cache metrics if available
+        # (matches Anthropic provider pattern - only include when non-zero)
+        usage_kwargs: dict[str, Any] = {
+            "input_tokens": total_input,
+            "output_tokens": output_tokens,
+            "total_tokens": total_input + output_tokens,
+        }
+        if cache_creation:
+            usage_kwargs["cache_creation_input_tokens"] = cache_creation
+        if cache_read:
+            usage_kwargs["cache_read_input_tokens"] = cache_read
+
+        usage = Usage(**usage_kwargs)
 
         # Determine finish reason
         finish_reason = "tool_use" if tool_calls else "end_turn"
