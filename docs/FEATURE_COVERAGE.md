@@ -69,9 +69,11 @@ This means features that require beta access (1M context window, interleaved thi
 
 **Tool definitions injected via system prompt**: Unlike the API where tools are first-class parameters, the CLI provider injects tool specs as JSON in the system prompt and parses `<tool_use>` blocks from response text.
 
-This works reliably but has edge cases:
-- Very large tool schemas can push system prompt size limits
-- Response text parsing must handle edge cases (tool calls in code examples, etc.)
+See **[ARCHITECTURE.md](ARCHITECTURE.md)** for detailed documentation on:
+- Text-based tool calling tradeoffs
+- Prompt structure and XML tag reference
+- Tool call parsing and validation
+- Session caching for prompt efficiency
 
 ## Development Lessons (Post-Mortem)
 

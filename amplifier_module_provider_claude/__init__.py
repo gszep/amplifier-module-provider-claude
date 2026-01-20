@@ -805,7 +805,7 @@ class ClaudeProvider:
             }
         )
 
-        return f"""<amplifier-transport>
+        return f"""<system-reminder source="tools-context">
 Available tools:
 <tools>
 {tools_json}
@@ -818,7 +818,7 @@ To call a tool, use this format:
 
 Generate a unique ID for each call (e.g., "call_1", "call_2").
 Tool results will be provided in <tool_result> blocks.
-</amplifier-transport>"""
+</system-reminder>"""
 
     # -------------------------------------------------------------------------
     # CLI execution

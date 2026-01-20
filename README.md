@@ -62,6 +62,7 @@ This gives Amplifier full control over the tool ecosystem while using your Claud
 
 ## Documentation
 
+- **[Architecture](docs/ARCHITECTURE.md)** — Prompt structure, text-based tool calling, session caching
 - **[Feature Coverage](docs/FEATURE_COVERAGE.md)** — Comparison with the Anthropic API provider, known limitations
 
 ## Development
