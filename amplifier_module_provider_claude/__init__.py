@@ -4,7 +4,13 @@ Full Control implementation using Claude Code CLI.
 Amplifier's orchestrator handles tool execution - Claude only decides which tools to call.
 """
 
-__all__ = ["mount", "ClaudeProvider"]
+__all__ = [
+    "mount",
+    "ClaudeProvider",
+    "SessionManager",
+    "SessionMetadata",
+    "SessionState",
+]
 
 # Amplifier module metadata
 __amplifier_module_type__ = "provider"
@@ -40,6 +46,8 @@ from amplifier_core.message_models import (  # type: ignore
     ToolCallBlock,
     Usage,
 )
+
+from .sessions import SessionManager, SessionMetadata, SessionState
 
 logger = logging.getLogger(__name__)
 
@@ -179,11 +187,21 @@ class ClaudeProvider:
         # detected repeatedly across LLM iterations.
         self._repaired_tool_ids: set[str] = set()
 
-        # Track Claude session ID internally for automatic session resumption.
-        # This enables prompt caching - subsequent calls within the same Amplifier
-        # session automatically resume the Claude session, getting cache hits.
-        # Each provider instance (per Amplifier session) has its own Claude session.
-        self._session_id: str | None = None
+        # Session persistence for prompt caching across restarts
+        # Uses disk-persisted sessions following amplifier-claude pattern
+        self._session_manager = SessionManager(
+            session_dir=self.config.get("session_dir"),
+        )
+
+        # Get Amplifier session ID from coordinator for session mapping
+        amplifier_session_id = self._get_amplifier_session_id()
+
+        # Load existing session or create new one
+        # This restores the Claude CLI session ID for cache resumption
+        self._session_state = self._session_manager.get_or_create_session(
+            session_id=amplifier_session_id,
+            name=self.config.get("session_name", "amplifier-claude"),
+        )
 
         # Track valid tool names for the session (updated each turn from request.tools).
         # Used to filter out tool calls that reference non-existent tools.
@@ -193,6 +211,47 @@ class ClaudeProvider:
         # These are tool calls that were rejected because the tool name wasn't valid.
         # Fed back to Claude so it knows those tools aren't available.
         self._filtered_tool_calls: list[dict[str, Any]] = []
+
+    def _get_amplifier_session_id(self) -> str | None:
+        """Get the Amplifier session ID from the coordinator.
+
+        Returns:
+            Session ID string if available, None otherwise.
+        """
+        if not self.coordinator:
+            return None
+
+        # Try to get session ID from coordinator's session attribute
+        if hasattr(self.coordinator, "session"):
+            session = getattr(self.coordinator, "session", None)
+            if session and hasattr(session, "id"):
+                return str(session.id)
+
+        # Try to get from coordinator's config
+        if hasattr(self.coordinator, "config"):
+            config = getattr(self.coordinator, "config", {})
+            if isinstance(config, dict) and "session_id" in config:
+                return str(config["session_id"])
+
+        return None
+
+    def _get_claude_session_id(self) -> str | None:
+        """Get the Claude CLI session ID for resumption.
+
+        Returns:
+            Claude session ID if available for cache resumption.
+        """
+        return self._session_state.metadata.claude_session_id
+
+    def _save_session(self) -> None:
+        """Save the current session state to disk."""
+        self._session_manager.save_session(self._session_state)
+        if self.debug:
+            efficiency = self._session_state.get_cache_efficiency()
+            logger.debug(
+                f"[PROVIDER] Session saved: {self._session_state.metadata.session_id}, "
+                f"cache efficiency: {efficiency:.1%}"
+            )
 
     def get_info(self) -> ProviderInfo:
         """Return provider information.
@@ -449,10 +508,10 @@ class ClaudeProvider:
         )
 
         # Check for existing session to resume
-        # Priority: 1) Explicit request metadata override, 2) Stored session ID
+        # Priority: 1) Explicit request metadata override, 2) Persisted session state
         request_metadata = getattr(request, "metadata", None) or {}
         existing_session_id = (
-            request_metadata.get(METADATA_SESSION_ID) or self._session_id
+            request_metadata.get(METADATA_SESSION_ID) or self._get_claude_session_id()
         )
         resuming = existing_session_id is not None
 
@@ -496,10 +555,10 @@ class ClaudeProvider:
         # Execute CLI and parse response (prompt passed via stdin)
         response_data = await self._execute_cli(cmd, full_prompt)
 
-        # Store session ID for automatic resumption in subsequent calls
+        # Store session ID in persistent session state for cache resumption
         response_session_id = response_data.get("metadata", {}).get(METADATA_SESSION_ID)
         if response_session_id:
-            self._session_id = response_session_id
+            self._session_state.set_claude_session_id(response_session_id)
             logger.debug(
                 f"[PROVIDER] Stored session ID for resumption: {response_session_id}"
             )
@@ -508,6 +567,19 @@ class ClaudeProvider:
 
         # Build ChatResponse
         chat_response = self._build_response(response_data, duration)
+
+        # Update session usage statistics and save to disk
+        usage_data = response_data.get("usage", {})
+        self._session_state.update_usage(
+            input_tokens=usage_data.get("input_tokens", 0),
+            output_tokens=usage_data.get("output_tokens", 0),
+            cache_read=usage_data.get("cache_read_input_tokens", 0),
+            cache_creation=usage_data.get("cache_creation_input_tokens", 0),
+            cost_usd=response_data.get("metadata", {}).get(METADATA_COST_USD, 0.0)
+            or 0.0,
+            duration_ms=int(duration * 1000),
+        )
+        self._save_session()
 
         # Emit response event
         await self._emit_event(
