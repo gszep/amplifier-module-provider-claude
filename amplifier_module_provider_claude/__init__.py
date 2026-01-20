@@ -179,6 +179,12 @@ class ClaudeProvider:
         # detected repeatedly across LLM iterations.
         self._repaired_tool_ids: set[str] = set()
 
+        # Track Claude session ID internally for automatic session resumption.
+        # This enables prompt caching - subsequent calls within the same Amplifier
+        # session automatically resume the Claude session, getting cache hits.
+        # Each provider instance (per Amplifier session) has its own Claude session.
+        self._session_id: str | None = None
+
     def get_info(self) -> ProviderInfo:
         """Return provider information.
 
@@ -398,8 +404,11 @@ class ClaudeProvider:
         )
 
         # Check for existing session to resume
+        # Priority: 1) Explicit request metadata override, 2) Stored session ID
         request_metadata = getattr(request, "metadata", None) or {}
-        existing_session_id = request_metadata.get(METADATA_SESSION_ID)
+        existing_session_id = (
+            request_metadata.get(METADATA_SESSION_ID) or self._session_id
+        )
         resuming = existing_session_id is not None
 
         # Convert messages to CLI format
@@ -441,6 +450,14 @@ class ClaudeProvider:
 
         # Execute CLI and parse response (prompt passed via stdin)
         response_data = await self._execute_cli(cmd, full_prompt)
+
+        # Store session ID for automatic resumption in subsequent calls
+        response_session_id = response_data.get("metadata", {}).get(METADATA_SESSION_ID)
+        if response_session_id:
+            self._session_id = response_session_id
+            logger.debug(
+                f"[PROVIDER] Stored session ID for resumption: {response_session_id}"
+            )
 
         duration = time.time() - start_time
 
