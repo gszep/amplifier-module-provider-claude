@@ -185,6 +185,15 @@ class ClaudeProvider:
         # Each provider instance (per Amplifier session) has its own Claude session.
         self._session_id: str | None = None
 
+        # Track valid tool names for the session (updated each turn from request.tools).
+        # Used to filter out tool calls that reference non-existent tools.
+        self._valid_tool_names: set[str] = set()
+
+        # Track filtered tool calls for the current turn (cleared each turn).
+        # These are tool calls that were rejected because the tool name wasn't valid.
+        # Fed back to Claude so it knows those tools aren't available.
+        self._filtered_tool_calls: list[dict[str, Any]] = []
+
     def get_info(self) -> ProviderInfo:
         """Return provider information.
 
@@ -341,6 +350,20 @@ class ClaudeProvider:
         Raises:
             RuntimeError: If CLI is not found or fails.
         """
+        # Update valid tool names for this session (used for filtering invalid tool calls)
+        self._valid_tool_names = set()
+        if request.tools:
+            for tool in request.tools:
+                if hasattr(tool, "name"):
+                    self._valid_tool_names.add(tool.name)
+                elif isinstance(tool, dict) and "name" in tool:
+                    self._valid_tool_names.add(tool["name"])
+
+        # Save filtered tool calls from previous turn (to feed back to Claude)
+        # then clear for this turn
+        previous_filtered_calls = self._filtered_tool_calls.copy()
+        self._filtered_tool_calls = []
+
         # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
         missing = self._find_missing_tool_results(request.messages)
 
@@ -387,6 +410,28 @@ class ClaudeProvider:
                         ],
                     },
                 )
+
+        # Inject feedback about filtered tool calls from previous turn
+        for tool_call in previous_filtered_calls:
+            request.messages.append(
+                Message(
+                    role="tool",
+                    content=(
+                        f"[SYSTEM NOTICE: Tool call rejected]\n\n"
+                        f"Tool: {tool_call['name']}\n"
+                        f"is not available in the current context and cannot be called.\n"
+                        f"Please acknowledge this error and offer to retry the operation."
+                    ),
+                    tool_call_id=tool_call["id"],
+                    name=tool_call["name"],
+                )
+            )
+
+        if previous_filtered_calls:
+            logger.info(
+                f"[PROVIDER] Injected feedback about {len(previous_filtered_calls)} "
+                f"filtered tool calls from previous turn."
+            )
 
         start_time = time.time()
 
@@ -1014,13 +1059,18 @@ Tool results will be provided in <tool_result> blocks.
     def _extract_tool_calls(self, text: str) -> list[dict[str, Any]]:
         """Extract tool calls from response text.
 
-        Looks for <tool_use>...</tool_use> blocks in the response.
+        Looks for <tool_use>...</tool_use> blocks in the response, filtering out:
+        - Tool calls inside markdown code blocks (documentation examples)
+        - Tool calls with names not in self._valid_tool_names
+
+        Filtered tool calls (invalid names) are stored in self._filtered_tool_calls
+        so they can be fed back to Claude in the next turn.
 
         Args:
             text: The response text to parse.
 
         Returns:
-            List of tool call dictionaries.
+            List of valid tool call dictionaries.
         """
         tool_calls = []
 
@@ -1028,7 +1078,16 @@ Tool results will be provided in <tool_result> blocks.
         import re
 
         pattern = r"<tool_use>\s*(.*?)\s*</tool_use>"
-        matches = re.findall(pattern, text, re.DOTALL)
+        matches = re.findall(
+            pattern,
+            re.sub(
+                r"```[\s\S]*?```",  # remove all markdown code blocks to avoid parsing documentation examples
+                "",
+                text,
+                flags=re.DOTALL,
+            ),
+            re.DOTALL,
+        )
 
         for match in matches:
             # Skip if content doesn't look like JSON (e.g., documentation text about tool_use)
@@ -1047,6 +1106,20 @@ Tool results will be provided in <tool_result> blocks.
                     "name": tool_data.get("tool", tool_data.get("name", "")),
                     "arguments": tool_data.get("input", tool_data.get("arguments", {})),
                 }
+
+                # Validate tool name against allowed list
+                if (
+                    self._valid_tool_names
+                    and tool_call["name"] not in self._valid_tool_names
+                ):
+                    logger.debug(
+                        f"[PROVIDER] Filtering tool call with invalid name: {tool_call['name']!r}. "
+                        f"Valid tools: {sorted(self._valid_tool_names)[:10]}..."
+                    )
+                    # Store filtered call for feedback to Claude
+                    self._filtered_tool_calls.append(tool_call)
+                    continue
+
                 tool_calls.append(tool_call)
             except json.JSONDecodeError as e:
                 logger.warning(
