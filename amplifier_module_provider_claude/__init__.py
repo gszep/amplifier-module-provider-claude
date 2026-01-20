@@ -511,6 +511,7 @@ class ClaudeProvider:
         """
         system_parts = []
         conversation_parts = []
+        tool_schema = ""
 
         # When resuming, only process current turn messages
         # Claude CLI caches conversation history, so we only need new content
@@ -519,9 +520,10 @@ class ClaudeProvider:
             # Skip system prompt and tool definitions - already cached by Claude CLI
         else:
             # Build tool definitions for system prompt (first call only)
+            # Stored separately to append AFTER bundle system messages
             if tools:
                 tool_definitions = self._convert_tools(tools)
-                system_parts.append(self._build_tool_instructions(tool_definitions))
+                tool_schema = self._build_tool_schema(tool_definitions)
 
         # Process messages
         for msg in messages:
@@ -553,6 +555,9 @@ class ClaudeProvider:
                 conversation_parts.append(f"{wrapped}")
 
         # Build final prompts
+        # Order: bundle system messages first (persona/behavior), then tool schema (transport)
+        if tool_schema:
+            system_parts.append(tool_schema)
         system_prompt = "\n\n".join(system_parts) if system_parts else ""
 
         # The user prompt is the conversation history
@@ -726,14 +731,17 @@ class ClaudeProvider:
 
         return tool_definitions
 
-    def _build_tool_instructions(self, tools: list[dict[str, Any]]) -> str:
-        """Build tool usage instructions for system prompt.
+    def _build_tool_schema(self, tools: list[dict[str, Any]]) -> str:
+        """Build pure tool schema for system prompt.
+
+        This provides only the structural information needed for tool calls.
+        Behavioral instructions should come from Amplifier's bundle system prompts.
 
         Args:
             tools: List of tool definitions.
 
         Returns:
-            Instruction string for system prompt.
+            Tool schema string with transport preamble.
         """
         if not tools:
             return ""
@@ -747,27 +755,20 @@ class ClaudeProvider:
             }
         )
 
-        return f"""You have access to the following tools:
+        return f"""<amplifier-transport>
+Available tools:
 <tools>
 {tools_json}
 </tools>
 
-CRITICAL - Follow the input_schema exactly:
-- For "enum" fields, ONLY use values listed in the enum array
-- For "required" fields, you MUST provide a value
-- Do NOT invent parameter names or values not defined in the schema
-
-To use a tool, output a tool_use block in this exact format:
+To call a tool, use this format:
 <tool_use>
 {tool_use_example}
 </tool_use>
 
-Important:
-- Generate a unique ID for each tool call (e.g., "call_1", "call_2", etc.)
-- Wait for the tool result before continuing
-- You can use multiple tools in sequence
-- Tool results will be provided in <tool_result> blocks
-- After receiving a tool result, continue your response or use another tool"""
+Generate a unique ID for each call (e.g., "call_1", "call_2").
+Tool results will be provided in <tool_result> blocks.
+</amplifier-transport>"""
 
     # -------------------------------------------------------------------------
     # CLI execution
@@ -806,27 +807,15 @@ Important:
             "",  # Disable ALL built-in tools - we provide our own
         ]
 
-        # Add session resumption OR system prompt (mutually exclusive)
+        # Add session resumption OR empty system prompt (mutually exclusive)
         # When resuming, Claude CLI has cached context including original system prompt
         if session_id:
             cmd.extend(["--resume", session_id])
             logger.info(f"[PROVIDER] Resuming Claude session: {session_id}")
         else:
-            # First call - override Claude's default persona with Amplifier role
-            amplifier_role = """<role>
-You are an AI assistant integrated with Amplifier, a modular AI agent framework.
-You operate as a provider within Amplifier's orchestration system.
-
-Your role:
-- Execute tasks delegated by Amplifier's orchestrator
-- Use the provided tools to accomplish user goals
-- Return structured responses that Amplifier can process
-- Follow tool schemas exactly as specified
-
-Amplifier handles tool execution externally - you decide which tools to call,
-but the orchestrator executes them and returns results to you.
-</role>"""
-            cmd.extend(["--system-prompt", amplifier_role])
+            # First call - override Claude's default persona with empty prompt
+            # Amplifier's bundle system messages define the persona, not the provider
+            cmd.extend(["--system-prompt", ""])
 
         # Enable extended thinking for models that support it
         if self.max_thinking_tokens > 0:

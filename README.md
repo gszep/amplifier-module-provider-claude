@@ -12,6 +12,9 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Install Claude Code CLI
 curl -fsSL https://claude.ai/install.sh | bash
+
+# Install Amplifier
+uv tool install git+https://github.com/microsoft/amplifier
 ```
 
 ### 2. Add the Provider
