@@ -581,7 +581,12 @@ class ClaudeProvider:
                     system_parts.append(f"<system-reminder>{content}</system-reminder>")
 
             elif role == "user":
-                conversation_parts.append(f"<user>{content}</user>")
+                # Check if this is a hook-injected system reminder (not actual user content)
+                # Hook content should appear outside <user> tags for cleaner prompt structure
+                if content.strip().startswith("<system-reminder"):
+                    conversation_parts.append(content)
+                else:
+                    conversation_parts.append(f"<user>{content}</user>")
 
             elif role == "assistant":
                 # Check for tool calls in assistant message

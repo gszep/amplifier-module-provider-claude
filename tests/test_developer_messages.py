@@ -106,3 +106,87 @@ class TestDeveloperMessageHandling:
                 f"Context position: {context_pos}, User position: {user_pos}\n"
                 f"User prompt: {user_prompt}"
             )
+
+
+class TestHookSystemReminderHandling:
+    """Test that hook-injected system reminders are formatted correctly.
+
+    Hooks inject <system-reminder> content as user messages, but these
+    should appear outside of <user> tags for cleaner prompt structure.
+    """
+
+    def test_system_reminder_not_wrapped_in_user_tags(self, provider):
+        """System reminder content should not be wrapped in <user> tags.
+
+        When a user message contains only <system-reminder> content (injected by hooks),
+        it should be passed through without the <user> wrapper.
+        """
+        messages = [
+            Message(role="user", content="What is 1+1?"),
+            Message(
+                role="user",
+                content='<system-reminder source="hooks-status">Working dir: /home</system-reminder>',
+            ),
+        ]
+
+        system_prompt, user_prompt = provider._convert_messages(messages, tools=None)
+
+        # The actual user message should be wrapped
+        assert "<user>What is 1+1?</user>" in user_prompt, (
+            "Regular user message should be wrapped in <user> tags"
+        )
+
+        # The system reminder should NOT be wrapped in <user> tags
+        assert "<user><system-reminder" not in user_prompt, (
+            "System reminder should NOT be wrapped in <user> tags"
+        )
+        assert '<system-reminder source="hooks-status">' in user_prompt, (
+            "System reminder content should be present"
+        )
+
+    def test_system_reminder_appears_after_user_message(self, provider):
+        """System reminder should appear after the user's actual message."""
+        messages = [
+            Message(role="user", content="Hello"),
+            Message(
+                role="user",
+                content="<system-reminder>Hook content</system-reminder>",
+            ),
+        ]
+
+        system_prompt, user_prompt = provider._convert_messages(messages, tools=None)
+
+        # Order should be preserved: user message then system reminder
+        user_pos = user_prompt.find("<user>Hello</user>")
+        reminder_pos = user_prompt.find(
+            "<system-reminder>Hook content</system-reminder>"
+        )
+
+        assert user_pos < reminder_pos, (
+            f"User message should appear before system reminder.\n"
+            f"User position: {user_pos}, Reminder position: {reminder_pos}\n"
+            f"User prompt: {user_prompt}"
+        )
+
+    def test_mixed_user_content_stays_wrapped(self, provider):
+        """User content that contains system-reminder but isn't purely a hook should stay wrapped.
+
+        If user types actual content before the system-reminder, keep the <user> wrapper.
+        Note: This test requires multiple messages because single-message conversations
+        have a special case that returns raw content without wrapping.
+        """
+        messages = [
+            Message(role="system", content="You are helpful"),
+            Message(
+                role="user",
+                content="My question is: <system-reminder>some text</system-reminder>",
+            ),
+        ]
+
+        system_prompt, user_prompt = provider._convert_messages(messages, tools=None)
+
+        # This should be wrapped because it doesn't START with <system-reminder>
+        assert "<user>My question is:" in user_prompt, (
+            f"Mixed content should stay wrapped in <user> tags.\n"
+            f"Got user_prompt: {user_prompt}"
+        )
