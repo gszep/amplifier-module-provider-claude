@@ -31,11 +31,11 @@ from amplifier_core import (  # type: ignore
     ThinkingContent,
     ToolCallContent,
 )
-from amplifier_core.events import (  # type: ignore
-    CONTENT_BLOCK_DELTA,
-    CONTENT_BLOCK_END,
-    CONTENT_BLOCK_START,
-)
+
+# Note: CONTENT_BLOCK_* events are NOT emitted by this provider during streaming.
+# The orchestrator handles display via response.content_blocks after complete().
+# This matches the official Anthropic provider's behavior and prevents the
+# "disappearing text" issue when responses contain both text and tool_calls.
 from amplifier_core.message_models import (  # type: ignore
     ChatRequest,
     ChatResponse,
@@ -57,6 +57,89 @@ class ClaudeChatResponse(ChatResponse):
 
     content_blocks: list[TextContent | ThinkingContent | ToolCallContent] | None = None
     text: str | None = None
+
+
+# -----------------------------------------------------------------------------
+# Structured Exceptions
+# -----------------------------------------------------------------------------
+
+
+class ClaudeProviderError(Exception):
+    """Base exception for Claude provider errors with structured information."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_type: str = "unknown",
+        is_recoverable: bool = False,
+        details: dict[str, Any] | None = None,
+    ):
+        super().__init__(message)
+        self.error_type = error_type
+        self.is_recoverable = is_recoverable
+        self.details = details or {}
+
+    def __str__(self) -> str:
+        return f"{self.error_type}: {super().__str__()}"
+
+
+class ContextLimitExceededError(ClaudeProviderError):
+    """Raised when the prompt exceeds the context window limit (200K tokens).
+
+    This error is NOT recoverable within the current session since Claude CLI
+    caches the full conversation history internally when using --resume.
+    Options:
+    - Start a new session
+    - Use session rewind to truncate history
+    """
+
+    def __init__(
+        self,
+        message: str = "Prompt is too long",
+        details: dict[str, Any] | None = None,
+    ):
+        super().__init__(
+            message,
+            error_type="context_limit_exceeded",
+            is_recoverable=False,
+            details=details,
+        )
+
+
+class RateLimitError(ClaudeProviderError):
+    """Raised when API rate limits are exceeded.
+
+    This error is recoverable with exponential backoff.
+    """
+
+    def __init__(
+        self,
+        message: str = "Rate limit exceeded",
+        details: dict[str, Any] | None = None,
+    ):
+        super().__init__(
+            message,
+            error_type="rate_limit",
+            is_recoverable=True,
+            details=details,
+        )
+
+
+class InvalidRequestError(ClaudeProviderError):
+    """Raised for invalid request errors from the API."""
+
+    def __init__(
+        self,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ):
+        super().__init__(
+            message,
+            error_type="invalid_request",
+            is_recoverable=False,
+            details=details,
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -211,6 +294,17 @@ class ClaudeProvider:
         # These are tool calls that were rejected because the tool name wasn't valid.
         # Fed back to Claude so it knows those tools aren't available.
         self._filtered_tool_calls: list[dict[str, Any]] = []
+
+        # Deferred tool calls workaround for StreamingUI bug.
+        # When Claude returns text + tool_calls together, the orchestrator emits
+        # content_block events but doesn't yield text (because tool_calls present).
+        # The StreamingUI shows text via events, but clears it on next iteration.
+        #
+        # Workaround: When we get text + tool_calls, return text-only first (so
+        # orchestrator yields it and user sees it), then return the deferred
+        # tool_calls on the next complete() call WITHOUT calling Claude again.
+        self._deferred_tool_calls: list[dict[str, Any]] | None = None
+        self._deferred_response_metadata: dict[str, Any] | None = None
 
     def _get_amplifier_session_id(self) -> str | None:
         """Get the Amplifier session ID from the coordinator.
@@ -409,6 +503,60 @@ class ClaudeProvider:
         Raises:
             RuntimeError: If CLI is not found or fails.
         """
+        # Check for deferred tool_calls from previous call.
+        # This is a workaround for a StreamingUI bug where text content shown via
+        # content_block events disappears when tool_calls are present (the UI clears
+        # text on iteration start). By returning text-only first, then tool_calls
+        # on the next call, we ensure text is yielded and displayed properly.
+        if self._deferred_tool_calls is not None:
+            logger.info(
+                f"[PROVIDER] Returning {len(self._deferred_tool_calls)} deferred tool call(s)"
+            )
+            deferred = self._deferred_tool_calls
+            metadata = self._deferred_response_metadata or {}
+            self._deferred_tool_calls = None
+            self._deferred_response_metadata = None
+
+            # Build tool_calls list
+            tool_calls = [
+                ToolCall(
+                    id=tc["id"],
+                    name=tc["name"],
+                    arguments=tc["arguments"],
+                )
+                for tc in deferred
+            ]
+
+            # Build content blocks for transcript storage
+            content_blocks = [
+                ToolCallBlock(
+                    id=tc["id"],
+                    name=tc["name"],
+                    input=tc["arguments"],
+                )
+                for tc in deferred
+            ]
+
+            # Build event blocks for UI
+            event_blocks = [
+                ToolCallContent(
+                    id=tc["id"],
+                    name=tc["name"],
+                    arguments=tc["arguments"],
+                )
+                for tc in deferred
+            ]
+
+            return ClaudeChatResponse(
+                content=content_blocks,
+                tool_calls=tool_calls,
+                usage=Usage(input_tokens=0, output_tokens=0, total_tokens=0),
+                finish_reason="tool_use",
+                metadata=metadata,
+                content_blocks=event_blocks,
+                text=None,
+            )
+
         # Update valid tool names for this session (used for filtering invalid tool calls)
         self._valid_tool_names = set()
         if request.tools:
@@ -975,7 +1123,6 @@ Tool results will be provided in <tool_result> blocks.
         metadata: dict[str, Any] = {}
         thinking_text = ""
         thinking_signature = ""
-        block_index = 0
 
         assert proc.stdout is not None
 
@@ -1019,39 +1166,11 @@ Tool results will be provided in <tool_result> blocks.
                             logger.debug(
                                 f"[PROVIDER] Thinking block: {len(thinking_text)} chars"
                             )
-
-                            # Emit streaming events for thinking block
-                            await self._emit_event(
-                                CONTENT_BLOCK_START,
-                                {
-                                    "index": block_index,
-                                    "content_block": ThinkingBlock(
-                                        thinking="",
-                                        signature=thinking_signature,
-                                    ),
-                                },
-                            )
-                            await self._emit_event(
-                                CONTENT_BLOCK_DELTA,
-                                {
-                                    "index": block_index,
-                                    "delta": ThinkingBlock(
-                                        thinking=thinking_text,
-                                        signature=thinking_signature,
-                                    ),
-                                },
-                            )
-                            await self._emit_event(
-                                CONTENT_BLOCK_END,
-                                {
-                                    "index": block_index,
-                                    "content_block": ThinkingBlock(
-                                        thinking=thinking_text,
-                                        signature=thinking_signature,
-                                    ),
-                                },
-                            )
-                            block_index += 1
+                            # Note: We do NOT emit content_block events here.
+                            # The orchestrator handles display via response.content_blocks.
+                            # Emitting events here causes "disappearing text" when tool_calls
+                            # are present, because the orchestrator doesn't yield text for
+                            # responses with tool_calls, but the UI showed it via events.
 
                         elif block_type == "text":
                             # Accumulate text content (multiple text blocks can appear)
@@ -1060,30 +1179,7 @@ Tool results will be provided in <tool_result> blocks.
                                 response_text += "\n" + text_content
                             else:
                                 response_text += text_content
-
-                            # Emit streaming events for text block
-                            await self._emit_event(
-                                CONTENT_BLOCK_START,
-                                {
-                                    "index": block_index,
-                                    "content_block": {"type": "text"},
-                                },
-                            )
-                            await self._emit_event(
-                                CONTENT_BLOCK_DELTA,
-                                {
-                                    "index": block_index,
-                                    "delta": {
-                                        "type": "text_delta",
-                                        "text": text_content,
-                                    },
-                                },
-                            )
-                            await self._emit_event(
-                                CONTENT_BLOCK_END,
-                                {"index": block_index},
-                            )
-                            block_index += 1
+                            # Note: No content_block events emitted here - see thinking block comment.
 
                 # Handle final result
                 elif event_type == "result":
