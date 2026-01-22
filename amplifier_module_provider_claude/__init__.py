@@ -32,10 +32,6 @@ from amplifier_core import (  # type: ignore
     ToolCallContent,
 )
 
-# Note: CONTENT_BLOCK_* events are NOT emitted by this provider during streaming.
-# The orchestrator handles display via response.content_blocks after complete().
-# This matches the official Anthropic provider's behavior and prevents the
-# "disappearing text" issue when responses contain both text and tool_calls.
 from amplifier_core.message_models import (  # type: ignore
     ChatRequest,
     ChatResponse,
@@ -229,14 +225,7 @@ class ClaudeProvider:
     """Claude Code CLI integration for Amplifier.
 
     Full Control mode: Amplifier's orchestrator handles all tool execution.
-    Claude only decides which tools to call - execution is handled externally.
-
-    This follows the same pattern as the OpenAI provider:
-    1. Provider receives request with messages and tools
-    2. Provider returns response with tool_calls (if any)
-    3. Orchestrator executes tools and adds results to messages
-    4. Provider receives next request with tool results
-    5. Repeat until no more tool_calls
+    Claude only decides which tools to call.
     """
 
     name = "claude"
@@ -265,46 +254,24 @@ class ClaudeProvider:
             self.config.get("max_thinking_tokens", DEFAULT_MAX_THINKING_TOKENS),
         )
 
-        # Track tool call IDs that have been repaired with synthetic results.
-        # This prevents infinite loops when the same missing tool results are
-        # detected repeatedly across LLM iterations.
+        # Track repaired tool call IDs to prevent infinite detection loops
         self._repaired_tool_ids: set[str] = set()
 
         # Session persistence for prompt caching across restarts
-        # Uses disk-persisted sessions following amplifier-claude pattern
         self._session_manager = SessionManager(
             session_dir=self.config.get("session_dir"),
         )
 
-        # Get Amplifier session ID from coordinator for session mapping
         amplifier_session_id = self._get_amplifier_session_id()
-
-        # Load existing session or create new one
-        # This restores the Claude CLI session ID for cache resumption
         self._session_state = self._session_manager.get_or_create_session(
             session_id=amplifier_session_id,
             name=self.config.get("session_name", "amplifier-claude"),
         )
 
-        # Track valid tool names for the session (updated each turn from request.tools).
-        # Used to filter out tool calls that reference non-existent tools.
+        # Valid tool names for filtering invalid tool calls
         self._valid_tool_names: set[str] = set()
-
-        # Track filtered tool calls for the current turn (cleared each turn).
-        # These are tool calls that were rejected because the tool name wasn't valid.
-        # Fed back to Claude so it knows those tools aren't available.
+        # Filtered tool calls fed back to Claude as unavailable
         self._filtered_tool_calls: list[dict[str, Any]] = []
-
-        # Deferred tool calls workaround for StreamingUI bug.
-        # When Claude returns text + tool_calls together, the orchestrator emits
-        # content_block events but doesn't yield text (because tool_calls present).
-        # The StreamingUI shows text via events, but clears it on next iteration.
-        #
-        # Workaround: When we get text + tool_calls, return text-only first (so
-        # orchestrator yields it and user sees it), then return the deferred
-        # tool_calls on the next complete() call WITHOUT calling Claude again.
-        self._deferred_tool_calls: list[dict[str, Any]] | None = None
-        self._deferred_response_metadata: dict[str, Any] | None = None
 
     def _get_amplifier_session_id(self) -> str | None:
         """Get the Amplifier session ID from the coordinator.
@@ -503,60 +470,6 @@ class ClaudeProvider:
         Raises:
             RuntimeError: If CLI is not found or fails.
         """
-        # Check for deferred tool_calls from previous call.
-        # This is a workaround for a StreamingUI bug where text content shown via
-        # content_block events disappears when tool_calls are present (the UI clears
-        # text on iteration start). By returning text-only first, then tool_calls
-        # on the next call, we ensure text is yielded and displayed properly.
-        if self._deferred_tool_calls is not None:
-            logger.info(
-                f"[PROVIDER] Returning {len(self._deferred_tool_calls)} deferred tool call(s)"
-            )
-            deferred = self._deferred_tool_calls
-            metadata = self._deferred_response_metadata or {}
-            self._deferred_tool_calls = None
-            self._deferred_response_metadata = None
-
-            # Build tool_calls list
-            tool_calls = [
-                ToolCall(
-                    id=tc["id"],
-                    name=tc["name"],
-                    arguments=tc["arguments"],
-                )
-                for tc in deferred
-            ]
-
-            # Build content blocks for transcript storage
-            content_blocks = [
-                ToolCallBlock(
-                    id=tc["id"],
-                    name=tc["name"],
-                    input=tc["arguments"],
-                )
-                for tc in deferred
-            ]
-
-            # Build event blocks for UI
-            event_blocks = [
-                ToolCallContent(
-                    id=tc["id"],
-                    name=tc["name"],
-                    arguments=tc["arguments"],
-                )
-                for tc in deferred
-            ]
-
-            return ClaudeChatResponse(
-                content=content_blocks,
-                tool_calls=tool_calls,
-                usage=Usage(input_tokens=0, output_tokens=0, total_tokens=0),
-                finish_reason="tool_use",
-                metadata=metadata,
-                content_blocks=event_blocks,
-                text=None,
-            )
-
         # Update valid tool names for this session (used for filtering invalid tool calls)
         self._valid_tool_names = set()
         if request.tools:
@@ -778,82 +691,51 @@ class ClaudeProvider:
         conversation_parts = []
         tool_schema = ""
 
-        # When resuming, only process current turn messages
-        # Claude CLI caches conversation history, so we only need new content
         if resuming:
             messages = self._get_current_turn_messages(messages)
-            # Skip system prompt and tool definitions - already cached by Claude CLI
         else:
-            # Build tool definitions for system prompt (first call only)
-            # Stored separately to append AFTER bundle system messages
             if tools:
                 tool_definitions = self._convert_tools(tools)
                 tool_schema = self._build_tool_schema(tool_definitions)
 
-        # Process messages
         for msg in messages:
             role = msg.role
             content = self._extract_content(msg)
 
             if role == "system":
-                # Skip system messages when resuming - already cached by Claude CLI
                 if not resuming:
                     system_parts.append(f"<system-reminder>{content}</system-reminder>")
 
             elif role == "user":
-                # Check if this is a hook-injected system reminder (not actual user content)
-                # Hook content should appear outside <user> tags for cleaner prompt structure
                 if content.strip().startswith("<system-reminder"):
                     conversation_parts.append(content)
                 else:
                     conversation_parts.append(f"<user>{content}</user>")
 
             elif role == "assistant":
-                # Check for tool calls in assistant message
                 assistant_content = self._format_assistant_message(msg)
                 conversation_parts.append(f"<assistant>{assistant_content}</assistant>")
 
             elif role == "tool":
-                # Tool result - format for Claude
                 tool_result = self._format_tool_result(msg)
                 conversation_parts.append(f"{tool_result}")
 
             elif role == "developer":
-                # Developer messages contain context files (like @mentions)
-                # Wrap in <context_file> tags following Anthropic provider pattern
                 wrapped = f"<context_file>\n{content}\n</context_file>"
                 conversation_parts.append(f"{wrapped}")
 
-        # Build final prompts
-        # Order: bundle system messages first (persona/behavior), then tool schema (transport)
         if tool_schema:
             system_parts.append(tool_schema)
         system_prompt = "\n\n".join(system_parts) if system_parts else ""
-
-        # The user prompt is the conversation history
-        # For multi-turn, we include the full conversation
         user_prompt = "\n\n".join(conversation_parts) if conversation_parts else ""
 
-        # If there's only one user message and no conversation history, simplify
         if len(messages) == 1 and messages[0].role == "user":
             user_prompt = self._extract_content(messages[0])
 
         return system_prompt, user_prompt
 
     def _get_current_turn_messages(self, messages: list[Message]) -> list[Message]:
-        """Get only messages from the current turn (after last assistant response).
-
-        When resuming a Claude CLI session, the CLI has the conversation history
-        cached. We only need to send:
-        - Tool results from the current turn (after the last assistant message)
-        - Any new user message
-
-        Args:
-            messages: Full list of conversation messages.
-
-        Returns:
-            Messages from the current turn only.
-        """
+        """Get only messages from the current turn (after last assistant response)."""
         # Find the last assistant message index
         last_assistant_idx = -1
         for i, msg in enumerate(messages):
@@ -1002,17 +884,7 @@ class ClaudeProvider:
         return tool_definitions
 
     def _build_tool_schema(self, tools: list[dict[str, Any]]) -> str:
-        """Build pure tool schema for system prompt.
-
-        This provides only the structural information needed for tool calls.
-        Behavioral instructions should come from Amplifier's bundle system prompts.
-
-        Args:
-            tools: List of tool definitions.
-
-        Returns:
-            Tool schema string with transport preamble.
-        """
+        """Build tool schema for system prompt."""
         if not tools:
             return ""
 
@@ -1050,23 +922,10 @@ Tool results will be provided in <tool_result> blocks.
         model: str,
         session_id: str | None,
     ) -> list[str]:
-        """Build the CLI command.
-
-        Note: System prompt is passed via stdin to avoid ARG_MAX limits.
-        The --system-prompt arg overrides Claude's default persona with
-        an Amplifier-specific role description.
-
-        Args:
-            cli_path: Path to the claude CLI.
-            model: Model name.
-            session_id: Optional session ID for resumption.
-
-        Returns:
-            List of command arguments.
-        """
+        """Build the CLI command."""
         cmd = [
             cli_path,
-            "-p",  # Print mode (non-interactive)
+            "-p",
             "--model",
             model,
             "--output-format",
@@ -1074,35 +933,22 @@ Tool results will be provided in <tool_result> blocks.
             "--verbose",
             "--include-partial-messages",
             "--tools",
-            "",  # Disable ALL built-in tools - we provide our own
+            "",
         ]
 
-        # Add session resumption OR empty system prompt (mutually exclusive)
-        # When resuming, Claude CLI has cached context including original system prompt
         if session_id:
             cmd.extend(["--resume", session_id])
             logger.info(f"[PROVIDER] Resuming Claude session: {session_id}")
         else:
-            # First call - override Claude's default persona with empty prompt
-            # Amplifier's bundle system messages define the persona, not the provider
             cmd.extend(["--system-prompt", ""])
 
-        # Enable extended thinking for models that support it
         if self.max_thinking_tokens > 0:
             cmd.extend(["--max-thinking-tokens", str(self.max_thinking_tokens)])
 
         return cmd
 
     async def _execute_cli(self, cmd: list[str], prompt: str) -> dict[str, Any]:
-        """Execute the CLI command and parse output.
-
-        Args:
-            cmd: The command to execute.
-            prompt: The prompt to send via stdin (avoids ARG_MAX limits).
-
-        Returns:
-            Dictionary with parsed response data.
-        """
+        """Execute the CLI command and parse output."""
         logger.debug("[PROVIDER] Executing Claude CLI")
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -1111,7 +957,6 @@ Tool results will be provided in <tool_result> blocks.
             stderr=asyncio.subprocess.PIPE,
         )
 
-        # Write prompt to stdin and close it
         assert proc.stdin is not None
         proc.stdin.write(prompt.encode("utf-8"))
         await proc.stdin.drain()
@@ -1126,16 +971,13 @@ Tool results will be provided in <tool_result> blocks.
 
         assert proc.stdout is not None
 
-        # Read in chunks to handle large JSON lines (thinking blocks can exceed 64KB)
-        # The default asyncio StreamReader limit is 64KB which is too small
         buffer = b""
         while True:
-            chunk = await proc.stdout.read(1024 * 1024)  # 1MB chunks
+            chunk = await proc.stdout.read(1024 * 1024)
             if not chunk:
                 break
             buffer += chunk
 
-            # Process complete lines from buffer
             while b"\n" in buffer:
                 line, buffer = buffer.split(b"\n", 1)
                 line_str = line.decode("utf-8").strip()
@@ -1151,7 +993,6 @@ Tool results will be provided in <tool_result> blocks.
 
                 event_type = event_data.get("type")
 
-                # Handle assistant messages - extract content blocks directly
                 if event_type == "assistant":
                     message = event_data.get("message", {})
                     content_blocks = message.get("content", [])
@@ -1160,30 +1001,20 @@ Tool results will be provided in <tool_result> blocks.
                         block_type = block.get("type")
 
                         if block_type == "thinking":
-                            # Extract thinking content and signature
                             thinking_text = block.get("thinking", "")
                             thinking_signature = block.get("signature", "")
                             logger.debug(
                                 f"[PROVIDER] Thinking block: {len(thinking_text)} chars"
                             )
-                            # Note: We do NOT emit content_block events here.
-                            # The orchestrator handles display via response.content_blocks.
-                            # Emitting events here causes "disappearing text" when tool_calls
-                            # are present, because the orchestrator doesn't yield text for
-                            # responses with tool_calls, but the UI showed it via events.
 
                         elif block_type == "text":
-                            # Accumulate text content (multiple text blocks can appear)
                             text_content = block.get("text", "")
                             if response_text and text_content:
                                 response_text += "\n" + text_content
                             else:
                                 response_text += text_content
-                            # Note: No content_block events emitted here - see thinking block comment.
 
-                # Handle final result
                 elif event_type == "result":
-                    # Use result text as fallback
                     if not response_text:
                         response_text = event_data.get("result", "")
 
