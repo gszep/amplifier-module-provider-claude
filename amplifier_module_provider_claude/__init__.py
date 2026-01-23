@@ -803,7 +803,8 @@ class ClaudeProvider:
                                 "tool": block.name,
                                 "id": block.id,
                                 "input": getattr(block, "input", {}),
-                            }
+                            },
+                            default=str,
                         )
                         parts.append(f"<tool_use>{tool_call_str}</tool_use>")
                 elif isinstance(block, dict):
@@ -815,7 +816,8 @@ class ClaudeProvider:
                                 "tool": block.get("name"),
                                 "id": block.get("id"),
                                 "input": block.get("input", {}),
-                            }
+                            },
+                            default=str,
                         )
                         parts.append(f"<tool_use>{tool_call_str}</tool_use>")
 
@@ -842,7 +844,7 @@ class ClaudeProvider:
             "is_error": is_error,
         }
 
-        return f"<tool_result>{json.dumps(result)}</tool_result>"
+        return f"<tool_result>{json.dumps(result, default=str)}</tool_result>"
 
     # -------------------------------------------------------------------------
     # Tool conversion
@@ -888,7 +890,7 @@ class ClaudeProvider:
         if not tools:
             return ""
 
-        tools_json = json.dumps(tools, indent=2)
+        tools_json = json.dumps(tools, indent=2, default=str)
         tool_use_example = json.dumps(
             {
                 "tool": "tool_name",
