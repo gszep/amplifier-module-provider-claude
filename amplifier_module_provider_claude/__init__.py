@@ -886,32 +886,59 @@ class ClaudeProvider:
         return tool_definitions
 
     def _build_tool_schema(self, tools: list[dict[str, Any]]) -> str:
-        """Build tool schema for system prompt."""
+        """Build tool schema for system prompt.
+
+        Format instructions come FIRST to avoid confusion about how to call tools.
+        Uses a concrete example from the actual tool list.
+        """
         if not tools:
             return ""
 
         tools_json = json.dumps(tools, indent=2, default=str)
+
+        # Build a concrete example using the first actual tool
+        first_tool = tools[0]
+        tool_name = first_tool.get("name", "example_tool")
+        input_schema = first_tool.get("input_schema", {})
+        properties = input_schema.get("properties", {})
+
+        # Build example input from the schema
+        example_input: dict[str, Any] = {}
+        for prop_name, prop_def in list(properties.items())[:2]:  # First 2 params
+            prop_type = prop_def.get("type", "string")
+            if prop_type == "string":
+                example_input[prop_name] = f"<{prop_name} value>"
+            elif prop_type == "integer" or prop_type == "number":
+                example_input[prop_name] = 1
+            elif prop_type == "boolean":
+                example_input[prop_name] = True
+            else:
+                example_input[prop_name] = f"<{prop_name}>"
+
         tool_use_example = json.dumps(
             {
-                "tool": "tool_name",
-                "id": "unique_id",
-                "input": {"param1": "value1"},
-            }
+                "tool": tool_name,
+                "id": "call_1",
+                "input": example_input if example_input else {"param": "value"},
+            },
+            indent=2,
         )
 
         return f"""<system-reminder source="tools-context">
-Available tools:
-<tools>
-{tools_json}
-</tools>
-
-To call a tool, use this format:
+TOOL CALLING FORMAT - Use ONLY this XML format to call tools:
 <tool_use>
 {tool_use_example}
 </tool_use>
 
-Generate a unique ID for each call (e.g., "call_1", "call_2").
-Tool results will be provided in <tool_result> blocks.
+Rules:
+- Generate unique IDs: "call_1", "call_2", etc.
+- Tool results appear in <tool_result> blocks
+- Do NOT use function calling syntax or any other format
+
+Available tools:
+<tools>
+{tools_json}
+</tools>
 </system-reminder>"""
 
     # -------------------------------------------------------------------------
