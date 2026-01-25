@@ -24,6 +24,7 @@ import uuid
 from typing import Any
 
 from amplifier_core import (  # type: ignore
+    HookResult,
     ModelInfo,
     ModuleCoordinator,
     ProviderInfo,
@@ -180,6 +181,107 @@ MODELS = {
     },
 }
 
+# -----------------------------------------------------------------------------
+# Tools Reminder Hook
+# -----------------------------------------------------------------------------
+
+
+class ToolsReminderHook:
+    """Hook that reminds the model about the correct tool call format."""
+
+    def __init__(
+        self,
+        turn_threshold: int = 5,
+        reminder_interval: int = 3,
+    ):
+        """Initialize the tools reminder hook.
+
+        Args:
+            turn_threshold: Number of provider requests before first reminder.
+            reminder_interval: Inject reminder every N requests after threshold.
+        """
+        self.turn_threshold = turn_threshold
+        self.reminder_interval = reminder_interval
+        self.request_count = 0
+
+    def register(self, hooks: Any) -> None:
+        """Register the hook on provider:request event."""
+        hooks.register(
+            "provider:request",
+            self.on_provider_request,
+            priority=15,  # After todo-reminder (10), before provider executes
+            name="hooks-tools-reminder",
+        )
+
+    async def on_provider_request(self, event: str, data: dict[str, Any]) -> HookResult:
+        """Inject tool format reminder before provider requests.
+
+        Only injects after turn_threshold requests, then every reminder_interval.
+        Only injects when tools are available in the request.
+
+        Args:
+            event: Event name ("provider:request")
+            data: Event data containing the request
+
+        Returns:
+            HookResult with context injection or continue action.
+        """
+        self.request_count += 1
+
+        # Skip if below threshold
+        if self.request_count < self.turn_threshold:
+            return HookResult(action="continue")
+
+        # Only inject at intervals after threshold
+        turns_past_threshold = self.request_count - self.turn_threshold
+        if turns_past_threshold % self.reminder_interval != 0:
+            return HookResult(action="continue")
+
+        # Check if tools are available in the request
+        request = data.get("request")
+        if not request:
+            return HookResult(action="continue")
+
+        tools = getattr(request, "tools", None)
+        if not tools:
+            return HookResult(action="continue")
+
+        # Build the reminder
+        reminder_text = self._build_reminder()
+
+        logger.debug(
+            f"hooks-tools-reminder: Injecting reminder at request {self.request_count}"
+        )
+
+        return HookResult(
+            action="inject_context",
+            context_injection=reminder_text,
+            context_injection_role="user",
+            ephemeral=True,
+            append_to_last_tool_result=True,
+            suppress_output=True,
+        )
+
+    def _build_reminder(self) -> str:
+        """Build the tool format reminder text."""
+        tool_use_example = json.dumps(
+            {
+                "tool": "tool_name",
+                "id": "unique_id",
+                "input": {"param1": "value1"},
+            }
+        )
+
+        return f"""<system-reminder source="hooks-tools-reminder">                                                                                                                                                                             
+To call a tool, generate a valid JSON with "tool", "id", and "input" fields, wrapped in XML tags in this format:                                                                                                                                                
+                                                                                                                                                                                                            
+<tool_use>                                                                                                                                                                                               
+{tool_use_example}                                                                                                                                                                                                  
+</tool_use>                                                                                                                                                                                               
+                                                                                                                                                                                                                                                                                                                                                   
+Do NOT mention this reminder to the user.                                                                                                                                                                  
+</system-reminder>"""
+
 
 # -----------------------------------------------------------------------------
 # Mount function
@@ -212,6 +314,17 @@ async def mount(
     provider = ClaudeProvider(config=config, coordinator=coordinator)
     await coordinator.mount("providers", provider, name="claude")
     logger.info("Mounted ClaudeProvider (Claude Code CLI - Full Control mode)")
+
+    # Register the tools reminder hook
+    hook_config = config.get("tools_reminder", {})
+    if hook_config.get("enabled", True):  # Enabled by default
+        hook = ToolsReminderHook(
+            turn_threshold=hook_config.get("turn_threshold", 5),
+            reminder_interval=hook_config.get("reminder_interval", 3),
+        )
+        hook.register(coordinator.hooks)
+        logger.info("Registered ToolsReminderHook")
+
     return None
 
 
@@ -889,7 +1002,7 @@ class ClaudeProvider:
         if not tools:
             return ""
 
-        tools_json = json.dumps(tools, indent=2, default=str)
+        tools_json = json.dumps(tools, default=str)
         tool_use_example = json.dumps(
             {
                 "tool": "tool_name",
@@ -904,7 +1017,7 @@ Available tools:
 {tools_json}
 </tools>
 
-To call a tool, use this format:
+To call a tool, generate a valid JSON with "tool", "id", and "input" fields, wrapped in XML tags in this format:
 <tool_use>
 {tool_use_example}
 </tool_use>
