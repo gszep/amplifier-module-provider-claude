@@ -1073,7 +1073,7 @@ Tool results will be provided in <tool_result> blocks.
         def is_inside_code_block(pos: int) -> bool:
             return any(start <= pos < end for start, end in code_block_ranges)
 
-        pattern = r""
+        pattern = r"<tool_use>\s*(.*?)\s*</tool_use>"
         for match in re.finditer(pattern, text, re.DOTALL):
             if is_inside_code_block(match.start()):
                 logger.debug("[PROVIDER] Skipping tool_use inside code block")
