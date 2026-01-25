@@ -26,6 +26,7 @@ from amplifier_core import ProviderInfo
 from amplifier_core import TextContent
 from amplifier_core import ThinkingContent
 from amplifier_core import ToolCallContent
+from amplifier_core.utils import truncate_values
 
 
 @dataclass
@@ -36,6 +37,8 @@ class WebSearchContent:
     query: str = ""
     results: list[dict[str, Any]] = field(default_factory=list)
     citations: list[dict[str, str]] = field(default_factory=list)
+
+
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
@@ -361,35 +364,11 @@ class AnthropicProvider:
     def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
         """Recursively truncate string values in nested structures.
 
-        Preserves structure, only truncates leaf string values longer than max_length.
-        Uses self.debug_truncate_length if max_length not specified.
-
-        Args:
-            obj: Any JSON-serializable structure (dict, list, primitives)
-            max_length: Maximum string length (defaults to self.debug_truncate_length)
-
-        Returns:
-            Structure with truncated string values
+        Delegates to shared utility from amplifier_core.utils.
         """
         if max_length is None:
             max_length = self.debug_truncate_length
-
-        # Type guard: max_length is guaranteed to be int after this point
-        assert max_length is not None, (
-            "max_length should never be None after initialization"
-        )
-
-        if isinstance(obj, str):
-            if len(obj) > max_length:
-                return (
-                    obj[:max_length] + f"... (truncated {len(obj) - max_length} chars)"
-                )
-            return obj
-        if isinstance(obj, dict):
-            return {k: self._truncate_values(v, max_length) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [self._truncate_values(item, max_length) for item in obj]
-        return obj  # Numbers, booleans, None pass through unchanged
+        return truncate_values(obj, max_length)
 
     def _find_missing_tool_results(
         self, messages: list[Message]
@@ -1458,7 +1437,10 @@ class AnthropicProvider:
                     # Add any additional config (e.g., max_uses for web search)
                     if hasattr(tool, "max_uses") and tool.max_uses is not None:
                         native_tool["max_uses"] = tool.max_uses
-                    if hasattr(tool, "user_location") and tool.user_location is not None:
+                    if (
+                        hasattr(tool, "user_location")
+                        and tool.user_location is not None
+                    ):
                         native_tool["user_location"] = tool.user_location
                     anthropic_tools.append(native_tool)
                 logger.debug(f"[PROVIDER] Added native tool: {tool_type}")
