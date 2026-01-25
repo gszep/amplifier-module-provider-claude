@@ -31,7 +31,6 @@ from amplifier_core import (  # type: ignore
     ThinkingContent,
     ToolCallContent,
 )
-
 from amplifier_core.message_models import (  # type: ignore
     ChatRequest,
     ChatResponse,
@@ -1063,75 +1062,50 @@ Tool results will be provided in <tool_result> blocks.
     # -------------------------------------------------------------------------
 
     def _extract_tool_calls(self, text: str) -> list[dict[str, Any]]:
-        """Extract tool calls from response text.
-
-        Looks for <tool_use>...</tool_use> blocks in the response, filtering out:
-        - Tool calls inside markdown code blocks (documentation examples)
-        - Tool calls with names not in self._valid_tool_names
-
-        Filtered tool calls (invalid names) are stored in self._filtered_tool_calls
-        so they can be fed back to Claude in the next turn.
-
-        Args:
-            text: The response text to parse.
-
-        Returns:
-            List of valid tool call dictionaries.
-        """
+        """Extract tool calls from response text."""
         tool_calls = []
-
-        # Find all tool_use blocks
         import re
 
-        pattern = r"<tool_use>\s*(.*?)\s*</tool_use>"
-        matches = re.findall(
-            pattern,
-            re.sub(
-                r"```[\s\S]*?```",  # remove all markdown code blocks to avoid parsing documentation examples
-                "",
-                text,
-                flags=re.DOTALL,
-            ),
-            re.DOTALL,
-        )
+        code_block_ranges = [
+            (m.start(), m.end()) for m in re.finditer(r"```[\s\S]*?```", text)
+        ]
 
-        for match in matches:
-            # Skip if content doesn't look like JSON (e.g., documentation text about tool_use)
-            stripped = match.strip()
+        def is_inside_code_block(pos: int) -> bool:
+            return any(start <= pos < end for start, end in code_block_ranges)
+
+        pattern = r""
+        for match in re.finditer(pattern, text, re.DOTALL):
+            if is_inside_code_block(match.start()):
+                logger.debug("[PROVIDER] Skipping tool_use inside code block")
+                continue
+
+            content = match.group(1)
+            stripped = content.strip()
             if not stripped.startswith("{"):
-                logger.debug(
-                    f"[PROVIDER] Skipping non-JSON content in tool_use block: "
-                    f"{stripped[:50]}..."
-                )
+                logger.debug(f"[PROVIDER] Skipping non-JSON: {stripped[:50]}...")
                 continue
 
             try:
-                tool_data = json.loads(match)
+                tool_data = json.loads(content)
                 tool_call = {
                     "id": tool_data.get("id", f"call_{uuid.uuid4().hex[:8]}"),
                     "name": tool_data.get("tool", tool_data.get("name", "")),
                     "arguments": tool_data.get("input", tool_data.get("arguments", {})),
                 }
 
-                # Validate tool name against allowed list
                 if (
                     self._valid_tool_names
                     and tool_call["name"] not in self._valid_tool_names
                 ):
                     logger.debug(
-                        f"[PROVIDER] Filtering tool call with invalid name: {tool_call['name']!r}. "
-                        f"Valid tools: {sorted(self._valid_tool_names)[:10]}..."
+                        f"[PROVIDER] Filtering invalid tool: {tool_call['name']!r}"
                     )
-                    # Store filtered call for feedback to Claude
                     self._filtered_tool_calls.append(tool_call)
                     continue
 
                 tool_calls.append(tool_call)
             except json.JSONDecodeError as e:
-                logger.warning(
-                    f"[PROVIDER] Failed to parse tool call JSON: {e}. "
-                    f"Content: {match[:200]}"
-                )
+                logger.warning(f"[PROVIDER] Failed to parse tool JSON: {e}")
                 continue
 
         return tool_calls
