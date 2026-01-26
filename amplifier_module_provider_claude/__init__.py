@@ -258,7 +258,6 @@ class ToolsReminderHook:
             context_injection=reminder_text,
             context_injection_role="user",
             ephemeral=True,
-            append_to_last_tool_result=True,
             suppress_output=True,
         )
 
