@@ -1,0 +1,18 @@
+bundle:
+  name: behavior-tools-reminder
+  version: 1.0.0
+  description: Claude provider with tools-reminder hook for stable tool formatting
+
+providers:
+  - module: provider-claude
+    source: git+https://github.com/gszep/amplifier-module-provider-claude@main
+    config:
+      default_model: opus
+      priority: 1
+
+hooks:
+  - module: hooks-tools-reminder
+    source: git+https://github.com/gszep/amplifier-module-hooks-tools-reminder@main
+    config:
+      inject_role: user
+      priority: 10

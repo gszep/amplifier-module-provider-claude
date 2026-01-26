@@ -35,8 +35,7 @@ This provider parses tool calls from model outputs and therefore the `tools-remi
 
 ```yaml
 behaviors:
-  - source: git+https://github.com/gszep/amplifier-module-provider-claude@main
-    path: behaviors/claude-with-tools-reminder.yaml
+  - source: git+https://github.com/gszep/amplifier-module-provider-claude@main#subdirectory=behaviors/behaviors/tools-reminder.yaml
 ```
 
 ## Models
