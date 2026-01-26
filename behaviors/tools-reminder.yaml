@@ -13,6 +13,3 @@ providers:
 hooks:
   - module: hooks-tools-reminder
     source: git+https://github.com/gszep/amplifier-module-hooks-tools-reminder@main
-    config:
-      inject_role: user
-      priority: 10

@@ -17,10 +17,11 @@ curl -fsSL https://claude.ai/install.sh | bash
 uv tool install git+https://github.com/microsoft/amplifier
 ```
 
-### 2. Add the Provider
+### 2. Add the provider and its dependency
 
 ```bash
 amplifier module add provider-claude --source git+https://github.com/gszep/amplifier-module-provider-claude@main
+amplifier module add hooks-tools-reminder --source git+https://github.com/gszep/amplifier-module-hooks-tools-reminder@main
 ```
 
 ### 3. Configuration
@@ -31,11 +32,12 @@ amplifier init
 
 > **Note**: If `ANTHROPIC_API_KEY` is set, Amplifier prefers direct API access. Remove it from `~/.amplifier/keys.env` to use your subscription.
 
-This provider parses tool calls from model outputs and therefore the `tools-reminder` hook is needed to minimize hallucinations `~/.amplifier/settings.yaml`:
+This provider parses tool calls from model outputs and therefore the `tools-reminder` hook is needed to minimize hallucinations. Append the following to your global settings `~/.amplifier/settings.yaml`:
 
 ```yaml
-behaviors:
-  - source: git+https://github.com/gszep/amplifier-module-provider-claude@main#subdirectory=behaviors/tools-reminder.yaml
+bundle:
+  app:
+  - git+https://github.com/gszep/amplifier-module-provider-claude@main#subdirectory=behaviors/tools-reminder.yaml
 ```
 
 ## Models
