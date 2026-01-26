@@ -23,13 +23,21 @@ uv tool install git+https://github.com/microsoft/amplifier
 amplifier module add provider-claude --source git+https://github.com/gszep/amplifier-module-provider-claude@main
 ```
 
-### 3. Configure it to be the default
+### 3. Configuration
 
 ```bash
 amplifier init
 ```
 
 > **Note**: If `ANTHROPIC_API_KEY` is set, Amplifier prefers direct API access. Remove it from `~/.amplifier/keys.env` to use your subscription.
+
+This provider parses tool calls from model outputs and therefore the `tools-reminder` hook is needed to minimize hallucinations `~/.amplifier/settings.yaml`:
+
+```yaml
+behaviors:
+  - source: git+https://github.com/gszep/amplifier-module-provider-claude@main
+    path: behaviors/claude-with-tools-reminder.yaml
+```
 
 ## Models
 
@@ -38,17 +46,6 @@ amplifier init
 | Sonnet | `sonnet` | Default — balanced speed and capability |
 | Opus | `opus` | Complex reasoning, extended thinking |
 | Haiku | `haiku` | Fast responses |
-
-## Configuration
-
-```yaml
-providers:
-  - module: provider-claude
-    name: claude
-    config:
-      default_model: sonnet
-      timeout: 300.0
-```
 
 ## How It Works
 

@@ -10,8 +10,8 @@ authors = [
 ]
 dependencies = [
     # Claude Code CLI must be installed: curl -fsSL https://claude.ai/install.sh | bash
-    # Hook for tool format reminders (handled by orchestrator, not within this module)
-    "amplifier-module-hooks-tools-reminder",
+    # Note: tools-reminder hook is bundled via behaviors/claude-with-tools-reminder.yaml
+    # Python dependencies do NOT mount hooks - bundles/behaviors do
 ]
 
 [project.entry-points."amplifier.modules"]
@@ -26,8 +26,6 @@ build-backend = "hatchling.build"
 [tool.uv]
 package = true
 
-[tool.uv.sources]
-amplifier-module-hooks-tools-reminder = { git = "https://github.com/gszep/amplifier-module-hooks-tools-reminder", branch = "main" }
 
 [tool.hatch.build.targets.wheel]
 packages = [

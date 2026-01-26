@@ -1,0 +1,25 @@
+# Claude Provider with Tools Reminder Hook
+#
+# This behavior bundles the Claude provider with the tools-reminder hook,
+# ensuring Claude receives proper tool format instructions via system reminders.
+#
+# Usage in settings.yaml:
+#   behaviors:
+#     - source: git+https://github.com/gszep/amplifier-module-provider-claude@main
+#       path: behaviors/claude-with-tools-reminder.yaml
+
+bundle:
+  name: claude-with-tools-reminder
+  version: 1.0.0
+  description: Claude provider with tools-reminder hook for proper tool formatting
+
+providers:
+  - module: provider-claude
+    source: git+https://github.com/gszep/amplifier-module-provider-claude@main
+    config:
+      default_model: opus
+      priority: 1
+
+hooks:
+  - module: hooks-tools-reminder
+    source: git+https://github.com/gszep/amplifier-module-hooks-tools-reminder@main
