@@ -9,8 +9,9 @@ authors = [
     { name = "Microsoft MADE:Explorations Team" },
 ]
 dependencies = [
-    # No runtime dependencies - uses Claude Code CLI directly via subprocess
     # Claude Code CLI must be installed: curl -fsSL https://claude.ai/install.sh | bash
+    # Hook for tool format reminders (handled by orchestrator, not within this module)
+    "amplifier-module-hooks-tools-reminder",
 ]
 
 [project.entry-points."amplifier.modules"]
@@ -24,6 +25,9 @@ build-backend = "hatchling.build"
 
 [tool.uv]
 package = true
+
+[tool.uv.sources]
+amplifier-module-hooks-tools-reminder = { git = "https://github.com/gszep/amplifier-module-hooks-tools-reminder", branch = "main" }
 
 [tool.hatch.build.targets.wheel]
 packages = [
