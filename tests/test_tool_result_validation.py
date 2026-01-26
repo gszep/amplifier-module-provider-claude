@@ -184,3 +184,100 @@ class TestSyntheticResultCreation:
 
         assert "search_web" in result.content
         assert "call_xyz" in result.content
+
+
+class TestJsonParseErrorFormatting:
+    """Test JSON parse error formatting for debugging."""
+
+    def test_format_json_parse_error_shows_position(self, provider):
+        """Error formatting should show line and column number."""
+        import json
+
+        content = '{"tool": "test", invalid}'
+        try:
+            json.loads(content)
+        except json.JSONDecodeError as e:
+            result = provider._format_json_parse_error(content, e)
+
+        assert "line" in result.lower()
+        assert "column" in result.lower()
+
+    def test_format_json_parse_error_shows_excerpt(self, provider):
+        """Error formatting should show content excerpt around error."""
+        import json
+
+        content = '{"tool": "test", "id": "call_1", invalid_key: "value"}'
+        try:
+            json.loads(content)
+        except json.JSONDecodeError as e:
+            result = provider._format_json_parse_error(content, e)
+
+        # Should contain the problematic area
+        assert "invalid_key" in result
+
+    def test_format_json_parse_error_shows_pointer(self, provider):
+        """Error formatting should show a pointer (^) to the error position."""
+        import json
+
+        content = '{"a": }'  # Error at position 6
+        try:
+            json.loads(content)
+        except json.JSONDecodeError as e:
+            result = provider._format_json_parse_error(content, e)
+
+        assert "^" in result
+
+    def test_format_json_parse_error_shows_full_content_when_short(self, provider):
+        """Short content should be shown in full."""
+        import json
+
+        content = '{"bad": json}'
+        try:
+            json.loads(content)
+        except json.JSONDecodeError as e:
+            result = provider._format_json_parse_error(content, e)
+
+        assert "Full content:" in result
+        assert content in result
+
+    def test_format_json_parse_error_truncates_long_content(self, provider):
+        """Long content should be truncated with ellipsis."""
+        import json
+
+        # Create content longer than 200 chars with error near the end
+        content = '{"key": "' + "x" * 300 + '", invalid}'
+        try:
+            json.loads(content)
+        except json.JSONDecodeError as e:
+            result = provider._format_json_parse_error(content, e)
+
+        # Should NOT show "Full content:" for long strings
+        assert "Full content:" not in result
+        # Should show ellipsis for truncation
+        assert "..." in result
+
+    def test_format_json_parse_error_handles_error_at_start(self, provider):
+        """Error at the beginning of content should be handled."""
+        import json
+
+        content = 'not json at all'
+        try:
+            json.loads(content)
+        except json.JSONDecodeError as e:
+            result = provider._format_json_parse_error(content, e)
+
+        assert "not json" in result
+        assert "^" in result
+
+    def test_format_json_parse_error_shows_error_message(self, provider):
+        """Should include the actual error message from JSONDecodeError."""
+        import json
+
+        content = '{"unclosed": '
+        try:
+            json.loads(content)
+        except json.JSONDecodeError as e:
+            result = provider._format_json_parse_error(content, e)
+
+        # Should contain the error type/message
+        assert "JSON error" in result

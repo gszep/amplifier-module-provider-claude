@@ -191,8 +191,8 @@ class ToolsReminderHook:
 
     def __init__(
         self,
-        turn_threshold: int = 5,
-        reminder_interval: int = 3,
+        turn_threshold: int = 1,
+        reminder_interval: int = 1,
     ):
         """Initialize the tools reminder hook.
 
@@ -272,14 +272,15 @@ class ToolsReminderHook:
             }
         )
 
-        return f"""<system-reminder source="hooks-tools-reminder">                                                                                                                                                                             
-To call a tool, generate a valid JSON with "tool", "id", and "input" fields, wrapped in XML tags in this format:                                                                                                                                                
-                                                                                                                                                                                                            
-<tool_use>                                                                                                                                                                                               
-{tool_use_example}                                                                                                                                                                                                  
-</tool_use>                                                                                                                                                                                               
-                                                                                                                                                                                                                                                                                                                                                   
-Do NOT mention this reminder to the user.                                                                                                                                                                  
+        return f"""<system-reminder source="hooks-tools-reminder">
+To call a tool, generate a valid JSON with "tool", "id", and "input" fields, wrapped in XML tags in this format:
+
+<tool_use>
+{tool_use_example}
+</tool_use>
+
+When calling multiple tools in a single response, generate separate XML block for each call.
+Do NOT mention this reminder to the user.
 </system-reminder>"""
 
 
@@ -1022,6 +1023,7 @@ To call a tool, generate a valid JSON with "tool", "id", and "input" fields, wra
 {tool_use_example}
 </tool_use>
 
+When calling multiple tools in a single response, generate separate XML block for each call.
 Generate a unique ID for each call (e.g., "call_1", "call_2").
 Tool results will be provided in <tool_result> blocks.
 </system-reminder>"""
@@ -1218,10 +1220,62 @@ Tool results will be provided in <tool_result> blocks.
 
                 tool_calls.append(tool_call)
             except json.JSONDecodeError as e:
-                logger.warning(f"[PROVIDER] Failed to parse tool JSON: {e}")
+                error_detail = self._format_json_parse_error(content, e)
+                logger.warning(f"[PROVIDER] Failed to parse tool JSON:\n{error_detail}")
                 continue
 
         return tool_calls
+
+    def _format_json_parse_error(
+        self, content: str, error: json.JSONDecodeError
+    ) -> str:
+        """Format a JSON parse error with context showing where it occurred.
+
+        Args:
+            content: The JSON string that failed to parse.
+            error: The JSONDecodeError exception.
+
+        Returns:
+            Formatted error string with content excerpt and error pointer.
+        """
+        # Get error position
+        pos = error.pos
+        lineno = error.lineno
+        colno = error.colno
+
+        # Show context around the error position
+        context_before = 40
+        context_after = 40
+
+        start = max(0, pos - context_before)
+        end = min(len(content), pos + context_after)
+
+        # Extract the excerpt
+        excerpt = content[start:end]
+
+        # Calculate pointer position within excerpt
+        pointer_pos = pos - start
+
+        # Build the pointer line
+        pointer_line = " " * pointer_pos + "^"
+
+        # Truncation indicators
+        prefix = "..." if start > 0 else ""
+        suffix = "..." if end < len(content) else ""
+
+        # Build detailed error message
+        lines = [
+            f"JSON error at line {lineno}, column {colno}: {error.msg}",
+            f"Content ({len(content)} chars total):",
+            f"  {prefix}{excerpt}{suffix}",
+            f"  {' ' * len(prefix)}{pointer_line}",
+        ]
+
+        # If content is short enough, show the full thing
+        if len(content) <= 200:
+            lines.append(f"Full content: {content!r}")
+
+        return "\n".join(lines)
 
     def _clean_response_text(self, text: str) -> str:
         """Remove tool_use blocks from response text.
