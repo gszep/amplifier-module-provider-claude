@@ -1044,7 +1044,7 @@ Tool results will be provided in <tool_result> blocks.
                 )
             else:
                 raise RuntimeError(
-                    f"Claude Code CLI failed (exit {proc.returncode}): Subscription limits may have been exceeded."
+                    f"Claude Code CLI failed (exit {proc.returncode}): Subscription limits may have been exceeded.\n"
                     "Check subscription https://claude.ai/settings/usage and API https://platform.claude.com/settings/billing.\n"
                     "If API billing is being used, this mean Amplifier has access to ANTHROPIC_API_KEY."
                 )
