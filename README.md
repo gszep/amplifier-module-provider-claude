@@ -13,31 +13,25 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # Install Claude Code CLI
 curl -fsSL https://claude.ai/install.sh | bash
 
-# Install Amplifier
-uv tool install git+https://github.com/microsoft/amplifier
+# Install Amplifier with the third-party provider
+uv tool install git+https://github.com/microsoft/amplifier \
+  --with git+https://github.com/gszep/amplifier-module-provider-claude@main \
 ```
 
-### 2. Add the provider and its dependency
+### 2. Configuration
 
 ```bash
-amplifier module add provider-claude --source git+https://github.com/gszep/amplifier-module-provider-claude@main
-amplifier module add hooks-tools-reminder --source git+https://github.com/gszep/amplifier-module-hooks-tools-reminder@main
-```
-
-### 3. Configuration
-
-```bash
-amplifier init
+amplifier init  # select [3] Claude Code
 ```
 
 > **Note**: If `ANTHROPIC_API_KEY` is set, Amplifier prefers direct API access. Remove it from `~/.amplifier/keys.env` to use your subscription.
 
-This provider parses tool calls from model outputs and therefore the `tools-reminder` hook is needed to minimize hallucinations. Append the following to your global settings `~/.amplifier/settings.yaml`:
+This provider parses tool calls from model outputs and therefore the `tools-reminder` hook is needed to minimize hallucinations. Prepend the following to your global settings `~/.amplifier/settings.yaml`:
 
 ```yaml
 bundle:
   app:
-  - git+https://github.com/gszep/amplifier-module-provider-claude@main#subdirectory=behaviors/tools-reminder.yaml
+  - git+https://github.com/gszep/amplifier-module-hooks-tools-reminder@main
 ```
 
 ## Models
@@ -62,14 +56,6 @@ This gives Amplifier full control over the tool ecosystem while using your Claud
 
 - **[Architecture](docs/ARCHITECTURE.md)** — Prompt structure, text-based tool calling, session caching
 - **[Feature Coverage](docs/FEATURE_COVERAGE.md)** — Comparison with the Anthropic API provider, known limitations
-
-## Development
-
-```bash
-uv run pytest tests/ -v      # Run tests
-uv run ruff check .          # Lint
-uv run pyright               # Type check
-```
 
 ## Contributing
 
