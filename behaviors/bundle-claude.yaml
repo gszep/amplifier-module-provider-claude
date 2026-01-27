@@ -1,7 +1,7 @@
 bundle:
-  name: behavior-tools-reminder
+  name: bundle-claude
   version: 1.0.0
-  description: Claude provider with tools-reminder hook for stable tool formatting
+  description: Claude provider with tools-reminder hook for stable tool calling
 
 providers:
   - module: provider-claude
