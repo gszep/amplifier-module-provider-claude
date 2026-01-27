@@ -1017,8 +1017,9 @@ Tool results will be provided in <tool_result> blocks.
                                 response_text += text_content
 
                 elif event_type == "result":
-                    if not response_text:
-                        response_text = event_data.get("result", "")
+                    result_text = event_data.get("result", "")
+                    if result_text:
+                        response_text = result_text
 
                     usage_data = event_data.get("usage", {})
                     session_id = event_data.get("session_id")
