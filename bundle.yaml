@@ -1,5 +1,5 @@
 bundle:
-  name: bundle-claude
+  name: bundle-provider-claude
   version: 1.0.0
   description: Claude provider with tools-reminder hook for stable tool calling
 
