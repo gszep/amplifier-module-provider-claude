@@ -14,8 +14,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 curl -fsSL https://claude.ai/install.sh | bash
 
 # Install Amplifier with the third-party provider
-uv tool install git+https://github.com/microsoft/amplifier \
-  --with git+https://github.com/gszep/amplifier-module-provider-claude@main \
+uv tool install git+https://github.com/microsoft/amplifier
+amplifier module add provider-claude --source git+https://github.com/gszep/amplifier-module-provider-claude@main
 ```
 
 ### 2. Configuration
