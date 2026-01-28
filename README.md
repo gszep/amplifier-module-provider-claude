@@ -1,6 +1,6 @@
 # Amplifier Claude Code Provider
 
-**Use your Claude Max/Pro subscription with Amplifier** — no API keys or per-token billing required.
+**Use Claude Code with Amplifier**
 
 ## Quick Start
 
@@ -24,7 +24,7 @@ amplifier module add provider-claude --source git+https://github.com/gszep/ampli
 amplifier init  # select [3] Claude Code
 ```
 
-> **Note**: If `ANTHROPIC_API_KEY` is set, Amplifier prefers direct API access. Remove it from `~/.amplifier/keys.env` to use your subscription.
+> **Note**: If `ANTHROPIC_API_KEY` is set in `~/.amplifier/keys.env` API billing will be used.
 
 This provider parses tool calls from model outputs and therefore the `tools-reminder` hook is needed to minimize hallucinations. Prepend the following to your global settings `~/.amplifier/settings.yaml`:
 
@@ -50,7 +50,7 @@ This provider wraps the Claude Code CLI in "Full Control" mode:
 - Amplifier's orchestrator handles all tool execution
 - Responses are parsed for `<tool_use>` blocks
 
-This gives Amplifier full control over the tool ecosystem while using your Claude subscription.
+This gives Amplifier full control over the tool ecosystem while using Claude Code.
 
 ## Documentation
 

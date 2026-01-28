@@ -6,12 +6,10 @@ license = "MIT"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
-    { name = "Microsoft MADE:Explorations Team" },
+    { name = "Grisha Szep" },
 ]
 dependencies = [
-    # Claude Code CLI must be installed: curl -fsSL https://claude.ai/install.sh | bash
-    # Note: tools-reminder hook is bundled via behaviors/claude-with-tools-reminder.yaml
-    # Python dependencies do NOT mount hooks - bundles/behaviors do
+    "claude-agent-sdk",
 ]
 
 [project.entry-points."amplifier.modules"]
@@ -42,7 +40,10 @@ asyncio_mode = "strict"
 
 [dependency-groups]
 dev = [
+    "amplifier-core",
     "pytest>=9.0.2",
     "pytest-asyncio>=1.3.0",
 ]
 
+[tool.uv.sources]
+amplifier-core = { git = "https://github.com/microsoft/amplifier-core", branch = "main" }

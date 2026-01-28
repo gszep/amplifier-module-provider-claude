@@ -12,15 +12,16 @@ __all__ = [
     "SessionState",
 ]
 
-# Amplifier module metadata
 __amplifier_module_type__ = "provider"
 
 import asyncio
 import json
 import logging
+import re
 import shutil
 import time
 import uuid
+from collections import defaultdict
 from typing import Any
 
 from amplifier_core import (  # type: ignore
@@ -41,6 +42,32 @@ from amplifier_core.message_models import (  # type: ignore
     ToolCallBlock,
     Usage,
 )
+from amplifier_core.utils import truncate_values
+from claude_agent_sdk import ClaudeSDKClient  # type: ignore[import-untyped]
+from claude_agent_sdk._errors import (  # type: ignore[import-untyped]
+    ClaudeSDKError,
+)
+from claude_agent_sdk._errors import (
+    CLINotFoundError as SDKCLINotFoundError,
+)
+from claude_agent_sdk._errors import (
+    ProcessError as SDKProcessError,
+)
+from claude_agent_sdk.types import (  # type: ignore[import-untyped]
+    AssistantMessage as SDKAssistantMessage,
+)
+from claude_agent_sdk.types import (
+    ClaudeAgentOptions,
+)
+from claude_agent_sdk.types import (
+    ResultMessage as SDKResultMessage,
+)
+from claude_agent_sdk.types import (
+    TextBlock as SDKTextBlock,
+)
+from claude_agent_sdk.types import (
+    ThinkingBlock as SDKThinkingBlock,
+)
 
 from .sessions import SessionManager, SessionMetadata, SessionState
 
@@ -48,20 +75,11 @@ logger = logging.getLogger(__name__)
 
 
 class ClaudeChatResponse(ChatResponse):
-    """ChatResponse with additional fields for streaming UI compatibility."""
-
     content_blocks: list[TextContent | ThinkingContent | ToolCallContent] | None = None
     text: str | None = None
 
 
-# -----------------------------------------------------------------------------
-# Structured Exceptions
-# -----------------------------------------------------------------------------
-
-
 class ClaudeProviderError(Exception):
-    """Base exception for Claude provider errors with structured information."""
-
     def __init__(
         self,
         message: str,
@@ -80,15 +98,6 @@ class ClaudeProviderError(Exception):
 
 
 class ContextLimitExceededError(ClaudeProviderError):
-    """Raised when the prompt exceeds the context window limit (200K tokens).
-
-    This error is NOT recoverable within the current session since Claude CLI
-    caches the full conversation history internally when using --resume.
-    Options:
-    - Start a new session
-    - Use session rewind to truncate history
-    """
-
     def __init__(
         self,
         message: str = "Prompt is too long",
@@ -103,11 +112,6 @@ class ContextLimitExceededError(ClaudeProviderError):
 
 
 class RateLimitError(ClaudeProviderError):
-    """Raised when API rate limits are exceeded.
-
-    This error is recoverable with exponential backoff.
-    """
-
     def __init__(
         self,
         message: str = "Rate limit exceeded",
@@ -122,8 +126,6 @@ class RateLimitError(ClaudeProviderError):
 
 
 class InvalidRequestError(ClaudeProviderError):
-    """Raised for invalid request errors from the API."""
-
     def __init__(
         self,
         message: str,
@@ -136,10 +138,6 @@ class InvalidRequestError(ClaudeProviderError):
             details=details,
         )
 
-
-# -----------------------------------------------------------------------------
-# Constants
-# -----------------------------------------------------------------------------
 
 METADATA_SESSION_ID = "claude:session_id"
 METADATA_COST_USD = "claude:cost_usd"
@@ -180,14 +178,8 @@ MODELS = {
     },
 }
 
-# -----------------------------------------------------------------------------
-# Mount function
-# -----------------------------------------------------------------------------
 
-
-async def mount(
-    coordinator: ModuleCoordinator, config: dict[str, Any] | None = None
-) -> None:
+async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
     """Mount the Claude provider using Claude Code CLI.
 
     Args:
@@ -195,7 +187,7 @@ async def mount(
         config: Optional configuration dictionary.
 
     Returns:
-        None (no cleanup needed for CLI-based provider).
+        Optional cleanup function.
     """
     config = config or {}
 
@@ -212,12 +204,13 @@ async def mount(
     await coordinator.mount("providers", provider, name="claude")
     logger.info("Mounted ClaudeProvider (Claude Code CLI - Full Control mode)")
 
-    return None
+    async def cleanup():
+        try:
+            await asyncio.shield(asyncio.to_thread(provider._save_session))
+        except (asyncio.CancelledError, Exception):
+            pass
 
-
-# -----------------------------------------------------------------------------
-# Provider Implementation
-# -----------------------------------------------------------------------------
+    return cleanup
 
 
 class ClaudeProvider:
@@ -244,19 +237,17 @@ class ClaudeProvider:
         self.config = config or {}
         self.coordinator = coordinator
 
-        # Configuration
         self.default_model = self.config.get("default_model", DEFAULT_MODEL)
         self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
         self.debug = self.config.get("debug", False)
+        self.raw_debug = self.config.get("raw_debug", False)
+        self.debug_truncate_length = self.config.get("debug_truncate_length", 180)
         self.max_thinking_tokens = max(
             MIN_THINKING_TOKENS,
             self.config.get("max_thinking_tokens", DEFAULT_MAX_THINKING_TOKENS),
         )
 
-        # Track repaired tool call IDs to prevent infinite detection loops
         self._repaired_tool_ids: set[str] = set()
-
-        # Session persistence for prompt caching across restarts
         self._session_manager = SessionManager(
             session_dir=self.config.get("session_dir"),
         )
@@ -267,10 +258,17 @@ class ClaudeProvider:
             name=self.config.get("session_name", "amplifier-claude"),
         )
 
-        # Valid tool names for filtering invalid tool calls
         self._valid_tool_names: set[str] = set()
-        # Filtered tool calls fed back to Claude as unavailable
         self._filtered_tool_calls: list[dict[str, Any]] = []
+
+    def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
+        """Recursively truncate string values in nested structures.
+
+        Delegates to shared utility from amplifier_core.utils.
+        """
+        if max_length is None:
+            max_length = self.debug_truncate_length
+        return truncate_values(obj, max_length)
 
     def _get_amplifier_session_id(self) -> str | None:
         """Get the Amplifier session ID from the coordinator.
@@ -281,13 +279,11 @@ class ClaudeProvider:
         if not self.coordinator:
             return None
 
-        # Try to get session ID from coordinator's session attribute
         if hasattr(self.coordinator, "session"):
             session = getattr(self.coordinator, "session", None)
             if session and hasattr(session, "id"):
                 return str(session.id)
 
-        # Try to get from coordinator's config
         if hasattr(self.coordinator, "config"):
             config = getattr(self.coordinator, "config", {})
             if isinstance(config, dict) and "session_id" in config:
@@ -296,15 +292,9 @@ class ClaudeProvider:
         return None
 
     def _get_claude_session_id(self) -> str | None:
-        """Get the Claude CLI session ID for resumption.
-
-        Returns:
-            Claude session ID if available for cache resumption.
-        """
         return self._session_state.metadata.claude_session_id
 
     def _save_session(self) -> None:
-        """Save the current session state to disk."""
         self._session_manager.save_session(self._session_state)
         if self.debug:
             efficiency = self._session_state.get_cache_efficiency()
@@ -314,30 +304,20 @@ class ClaudeProvider:
             )
 
     def get_info(self) -> ProviderInfo:
-        """Return provider information.
-
-        Returns:
-            ProviderInfo with capabilities and configuration fields.
-        """
         return ProviderInfo(
             id="claude",
             display_name="Claude Code",
-            credential_env_vars=[],  # No API key needed - uses Claude Code auth
+            credential_env_vars=[],
             capabilities=["streaming", "tools", "thinking"],
             defaults={
                 "model": self.default_model,
                 "max_tokens": DEFAULT_MAX_TOKENS,
                 "timeout": self.timeout,
             },
-            config_fields=[],  # No interactive configuration needed
+            config_fields=[],
         )
 
     async def list_models(self) -> list[ModelInfo]:
-        """List available models.
-
-        Returns:
-            List of ModelInfo objects for available Claude models.
-        """
         return [
             ModelInfo(
                 id=spec["id"],
@@ -368,8 +348,6 @@ class ClaudeProvider:
         if not response.tool_calls:
             return []
 
-        # Filter out tool calls with empty arguments (Claude API quirk)
-        # Claude sometimes generates tool_use blocks with empty input {}
         valid_calls = []
         for tc in response.tool_calls:
             # Skip tool calls with no arguments or empty dict
@@ -385,43 +363,23 @@ class ClaudeProvider:
 
         return valid_calls
 
-    # -------------------------------------------------------------------------
-    # Tool result validation and repair
-    # -------------------------------------------------------------------------
-
     def _find_missing_tool_results(
         self, messages: list[Message]
     ) -> list[tuple[int, str, str, dict]]:
-        """Find tool calls without matching results.
-
-        Scans conversation for assistant tool calls and validates each has
-        a corresponding tool result message. Returns missing pairs WITH their
-        source message index so they can be inserted in the correct position.
-
-        Excludes tool call IDs that have already been repaired with synthetic
-        results to prevent infinite detection loops.
-
-        Returns:
-            List of (msg_index, call_id, tool_name, tool_arguments) tuples for unpaired calls.
-            msg_index is the index of the assistant message containing the tool_use block.
-        """
         tool_calls = {}  # {call_id: (msg_index, name, args)}
         tool_results = set()  # {call_id}
 
         for idx, msg in enumerate(messages):
-            # Check assistant messages for ToolCallBlock in content
             if msg.role == "assistant" and isinstance(msg.content, list):
                 for block in msg.content:
                     if hasattr(block, "type") and block.type == "tool_call":
                         tool_calls[block.id] = (idx, block.name, block.input)
 
-            # Check tool messages for tool_call_id
             elif (
                 msg.role == "tool" and hasattr(msg, "tool_call_id") and msg.tool_call_id
             ):
                 tool_results.add(msg.tool_call_id)
 
-        # Exclude IDs that have already been repaired to prevent infinite loops
         return [
             (msg_idx, call_id, name, args)
             for call_id, (msg_idx, name, args) in tool_calls.items()
@@ -450,10 +408,6 @@ class ClaudeProvider:
             name=tool_name,
         )
 
-    # -------------------------------------------------------------------------
-    # Main completion method
-    # -------------------------------------------------------------------------
-
     async def complete(self, request: ChatRequest, **kwargs: Any) -> ChatResponse:
         """Execute a completion request via Claude Code CLI.
 
@@ -469,7 +423,7 @@ class ClaudeProvider:
         Raises:
             RuntimeError: If CLI is not found or fails.
         """
-        # Update valid tool names for this session (used for filtering invalid tool calls)
+
         self._valid_tool_names = set()
         if request.tools:
             for tool in request.tools:
@@ -478,14 +432,10 @@ class ClaudeProvider:
                 elif isinstance(tool, dict) and "name" in tool:
                     self._valid_tool_names.add(tool["name"])
 
-        # Save filtered tool calls from previous turn (to feed back to Claude)
-        # then clear for this turn
         previous_filtered_calls = self._filtered_tool_calls.copy()
         self._filtered_tool_calls = []
 
-        # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
         missing = self._find_missing_tool_results(request.messages)
-
         if missing:
             logger.warning(
                 f"[PROVIDER] Claude: Detected {len(missing)} missing tool result(s). "
@@ -493,30 +443,20 @@ class ClaudeProvider:
                 f"Tool IDs: {[call_id for _, call_id, _, _ in missing]}"
             )
 
-            # Group missing results by source assistant message index
-            # We need to insert synthetic results IMMEDIATELY after each assistant message
-            # that contains tool_use blocks (not at the end of the list)
-            from collections import defaultdict
-
             by_msg_idx: dict[int, list[tuple[str, str]]] = defaultdict(list)
             for msg_idx, call_id, tool_name, _ in missing:
                 by_msg_idx[msg_idx].append((call_id, tool_name))
 
-            # Insert synthetic results in reverse order of message index
-            # (so earlier insertions don't shift later indices)
             for msg_idx in sorted(by_msg_idx.keys(), reverse=True):
                 synthetics = []
                 for call_id, tool_name in by_msg_idx[msg_idx]:
                     synthetics.append(self._create_synthetic_result(call_id, tool_name))
-                    # Track this ID so we don't detect it as missing again in future iterations
                     self._repaired_tool_ids.add(call_id)
 
-                # Insert all synthetic results immediately after the assistant message
                 insert_pos = msg_idx + 1
                 for i, synthetic in enumerate(synthetics):
                     request.messages.insert(insert_pos + i, synthetic)
 
-            # Emit observability event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 await self.coordinator.hooks.emit(
                     "provider:tool_sequence_repaired",
@@ -530,7 +470,6 @@ class ClaudeProvider:
                     },
                 )
 
-        # Inject feedback about filtered tool calls from previous turn
         for tool_call in previous_filtered_calls:
             request.messages.append(
                 Message(
@@ -553,54 +492,30 @@ class ClaudeProvider:
             )
 
         start_time = time.time()
-
-        # Find CLI
-        cli_path = shutil.which("claude")
-        if not cli_path:
-            raise RuntimeError(
-                "Claude Code CLI not found. Install with: "
-                "curl -fsSL https://claude.ai/install.sh | bash"
-            )
-
-        # Get model
         model = (
             kwargs.get("model") or getattr(request, "model", None) or self.default_model
         )
 
-        # Check for existing session to resume
-        # Priority: 1) Explicit request metadata override, 2) Persisted session state
         request_metadata = getattr(request, "metadata", None) or {}
         existing_session_id = (
             request_metadata.get(METADATA_SESSION_ID) or self._get_claude_session_id()
         )
-        resuming = existing_session_id is not None
 
-        # Convert messages to CLI format
-        # When resuming, Claude CLI has cached history - only send current turn
+        resuming = existing_session_id is not None
         system_prompt, user_prompt = self._convert_messages(
             request.messages, request.tools, resuming=resuming
         )
 
-        # Build command (without system prompt - passed via stdin to avoid ARG_MAX)
-        cmd = self._build_command(
-            cli_path=cli_path,
-            model=model,
-            session_id=existing_session_id,
-        )
-
-        # Combine system prompt and user prompt for stdin
-        # System instructions go first, then the user's actual request
         if system_prompt:
             full_prompt = f"{system_prompt}\n\n{user_prompt}"
         else:
             full_prompt = user_prompt
 
         if self.debug:
-            logger.debug(f"[PROVIDER] Command: {' '.join(cmd[:10])}...")
             logger.debug(f"[PROVIDER] System prompt length: {len(system_prompt)}")
             logger.debug(f"[PROVIDER] User prompt: {user_prompt[:200]}...")
 
-        # Emit request event
+        # Emit request events
         await self._emit_event(
             "llm:request",
             {
@@ -612,10 +527,76 @@ class ClaudeProvider:
             },
         )
 
-        # Execute CLI and parse response (prompt passed via stdin)
-        response_data = await self._execute_cli(cmd, full_prompt)
+        # DEBUG level: Request details with truncated values
+        if self.debug:
+            await self._emit_event(
+                "llm:request:debug",
+                {
+                    "lvl": "DEBUG",
+                    "provider": self.name,
+                    "request": self._truncate_values(
+                        {
+                            "model": model,
+                            "prompt_length": len(full_prompt),
+                            "resume_session": existing_session_id,
+                            "tools_count": len(request.tools) if request.tools else 0,
+                            "max_thinking_tokens": self.max_thinking_tokens,
+                        }
+                    ),
+                },
+            )
 
-        # Store session ID in persistent session state for cache resumption
+        # RAW level: Complete prompt as sent to CLI
+        if self.debug and self.raw_debug:
+            await self._emit_event(
+                "llm:request:raw",
+                {
+                    "lvl": "DEBUG",
+                    "provider": self.name,
+                    "prompt": full_prompt,
+                    "model": model,
+                    "session_id": existing_session_id,
+                },
+            )
+
+        try:
+            async with asyncio.timeout(self.timeout):
+                response_data = await self._execute_sdk_query(
+                    full_prompt, model, existing_session_id
+                )
+        except TimeoutError:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            error_msg = f"Request timed out after {self.timeout}s"
+            logger.error(f"[PROVIDER] {error_msg}")
+            await self._emit_event(
+                "llm:response",
+                {
+                    "provider": self.name,
+                    "model": model,
+                    "status": "error",
+                    "duration_ms": elapsed_ms,
+                    "error": error_msg,
+                },
+            )
+            raise TimeoutError(error_msg) from None
+        except Exception as e:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            error_msg = str(e) or f"{type(e).__name__}: (no message)"
+            logger.error(f"[PROVIDER] Claude error: {error_msg}")
+            await self._emit_event(
+                "llm:response",
+                {
+                    "provider": self.name,
+                    "model": model,
+                    "status": "error",
+                    "duration_ms": elapsed_ms,
+                    "error": error_msg,
+                },
+            )
+            if not str(e):
+                raise type(e)(error_msg) from e
+            raise
+
         response_session_id = response_data.get("metadata", {}).get(METADATA_SESSION_ID)
         if response_session_id:
             self._session_state.set_claude_session_id(response_session_id)
@@ -624,11 +605,8 @@ class ClaudeProvider:
             )
 
         duration = time.time() - start_time
-
-        # Build ChatResponse
         chat_response = self._build_response(response_data, duration)
 
-        # Update session usage statistics and save to disk
         usage_data = response_data.get("usage", {})
         self._session_state.update_usage(
             input_tokens=usage_data.get("input_tokens", 0),
@@ -641,7 +619,7 @@ class ClaudeProvider:
         )
         self._save_session()
 
-        # Emit response event
+        # Emit response events
         await self._emit_event(
             "llm:response",
             {
@@ -664,11 +642,31 @@ class ClaudeProvider:
             },
         )
 
-        return chat_response
+        # DEBUG level: Full response with truncated values
+        if self.debug:
+            await self._emit_event(
+                "llm:response:debug",
+                {
+                    "lvl": "DEBUG",
+                    "provider": self.name,
+                    "response": self._truncate_values(response_data),
+                    "status": "ok",
+                    "duration_ms": int(duration * 1000),
+                },
+            )
 
-    # -------------------------------------------------------------------------
-    # Message conversion
-    # -------------------------------------------------------------------------
+        # RAW level: Complete response data
+        if self.debug and self.raw_debug:
+            await self._emit_event(
+                "llm:response:raw",
+                {
+                    "lvl": "DEBUG",
+                    "provider": self.name,
+                    "response": response_data,
+                },
+            )
+
+        return chat_response
 
     def _convert_messages(
         self,
@@ -676,16 +674,6 @@ class ClaudeProvider:
         tools: list[Any] | None,
         resuming: bool = False,
     ) -> tuple[str, str]:
-        """Convert Amplifier messages to Claude CLI format.
-
-        Args:
-            messages: List of Amplifier Message objects.
-            tools: List of tool specifications.
-            resuming: If True, only include current turn (Claude CLI has cached history).
-
-        Returns:
-            Tuple of (system_prompt, user_prompt).
-        """
         system_parts = []
         conversation_parts = []
         tool_schema = ""
@@ -734,32 +722,19 @@ class ClaudeProvider:
         return system_prompt, user_prompt
 
     def _get_current_turn_messages(self, messages: list[Message]) -> list[Message]:
-        """Get only messages from the current turn (after last assistant response)."""
-        # Find the last assistant message index
         last_assistant_idx = -1
+
         for i, msg in enumerate(messages):
             if msg.role == "assistant":
                 last_assistant_idx = i
 
         if last_assistant_idx == -1:
-            # No assistant message yet - this is first turn, return all
             return messages
 
-        # Return everything after the last assistant message
-        # This includes tool results and any new user/developer messages
         current_turn = messages[last_assistant_idx + 1 :]
-
         return current_turn
 
     def _extract_content(self, msg: Message) -> str:
-        """Extract text content from a message.
-
-        Args:
-            msg: The message to extract content from.
-
-        Returns:
-            String content of the message.
-        """
         content = msg.content
 
         if isinstance(content, str):
@@ -777,14 +752,6 @@ class ClaudeProvider:
         return str(content) if content else ""
 
     def _format_assistant_message(self, msg: Message) -> str:
-        """Format an assistant message, including any tool calls.
-
-        Args:
-            msg: The assistant message.
-
-        Returns:
-            Formatted string representation.
-        """
         parts = []
 
         content = msg.content
@@ -823,14 +790,6 @@ class ClaudeProvider:
         return "\n".join(parts)
 
     def _format_tool_result(self, msg: Message) -> str:
-        """Format a tool result message.
-
-        Args:
-            msg: The tool result message.
-
-        Returns:
-            Formatted tool result string.
-        """
         tool_call_id = getattr(msg, "tool_call_id", None)
         tool_name = getattr(msg, "name", "unknown")
         content = self._extract_content(msg)
@@ -845,31 +804,17 @@ class ClaudeProvider:
 
         return f"<tool_result>{json.dumps(result, default=str)}</tool_result>"
 
-    # -------------------------------------------------------------------------
-    # Tool conversion
-    # -------------------------------------------------------------------------
-
     def _convert_tools(self, tools: list[Any]) -> list[dict[str, Any]]:
-        """Convert Amplifier tool specs to Claude format.
-
-        Args:
-            tools: List of ToolSpec objects.
-
-        Returns:
-            List of tool definitions in Claude format.
-        """
         tool_definitions = []
 
         for tool in tools:
             if hasattr(tool, "name"):
-                # ToolSpec object - use "parameters" (ToolSpec field name)
                 tool_def = {
                     "name": tool.name,
                     "description": getattr(tool, "description", ""),
                     "input_schema": getattr(tool, "parameters", {}),
                 }
             elif isinstance(tool, dict):
-                # Dictionary format - prefer "parameters" (ToolSpec convention)
                 tool_def = {
                     "name": tool.get("name", ""),
                     "description": tool.get("description", ""),
@@ -885,7 +830,6 @@ class ClaudeProvider:
         return tool_definitions
 
     def _build_tool_schema(self, tools: list[dict[str, Any]]) -> str:
-        """Build tool schema for system prompt."""
         if not tools:
             return ""
 
@@ -909,145 +853,195 @@ To call a tool, generate a valid JSON with "tool", "id", and "input" fields, wra
 {tool_use_example}
 </tool_use>
 
-When calling multiple tools in a single response, generate separate XML block for each call.
+CRITICAL RULES:
+1. Place ALL <tool_use> blocks at the END of your response
+2. After generating <tool_use> blocks, STOP IMMEDIATELY - do not generate any content after them
+3. Do NOT generate hypothetical tool results or continue with analysis before receiving actual results
+4. Do NOT generate JSON arrays with "result_type": "tool_result" - wait for actual <tool_result> blocks
+5. Multiple tool calls are allowed - generate separate <tool_use> blocks for each
+
 Generate a unique ID for each call (e.g., "call_1", "call_2").
-Tool results will be provided in <tool_result> blocks.
+Tool results will be provided in <tool_result> blocks in the next message. Wait for them.
 </system-reminder>"""
 
-    # -------------------------------------------------------------------------
-    # CLI execution
-    # -------------------------------------------------------------------------
-
-    def _build_command(
+    async def _execute_sdk_query(
         self,
-        cli_path: str,
+        prompt: str,
         model: str,
         session_id: str | None,
-    ) -> list[str]:
-        """Build the CLI command."""
-        cmd = [
-            cli_path,
-            "-p",
-            "--model",
-            model,
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--include-partial-messages",
-            "--tools",
-            "",
-        ]
+    ) -> dict[str, Any]:
+        """Execute a query via the Claude Agent SDK using ClaudeSDKClient.
 
+        Uses ClaudeSDKClient for better session management while keeping
+        the XML-based tool protocol for Amplifier orchestrator compatibility.
+        """
         if session_id:
-            cmd.extend(["--resume", session_id])
             logger.info(f"[PROVIDER] Resuming Claude session: {session_id}")
-        else:
-            cmd.extend(["--system-prompt", ""])
 
-        if self.max_thinking_tokens > 0:
-            cmd.extend(["--max-thinking-tokens", str(self.max_thinking_tokens)])
-
-        return cmd
-
-    async def _execute_cli(self, cmd: list[str], prompt: str) -> dict[str, Any]:
-        """Execute the CLI command and parse output."""
-        logger.debug("[PROVIDER] Executing Claude CLI")
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        sdk_options = ClaudeAgentOptions(
+            tools=[],  # Disable built-in tools (Full Control mode)
+            model=model,
+            system_prompt="",  # System prompt is included in user message
+            resume=session_id,
+            max_thinking_tokens=(
+                self.max_thinking_tokens if self.max_thinking_tokens > 0 else None
+            ),
+            include_partial_messages=True,
         )
 
-        assert proc.stdin is not None
-        proc.stdin.write(prompt.encode("utf-8"))
-        await proc.stdin.drain()
-        proc.stdin.close()
-        await proc.stdin.wait_closed()
+        logger.debug("[PROVIDER] Executing Claude CLI via ClaudeSDKClient")
 
         response_text = ""
-        usage_data: dict[str, Any] = {}
-        metadata: dict[str, Any] = {}
         thinking_text = ""
         thinking_signature = ""
+        usage_data: dict[str, Any] = {}
+        metadata: dict[str, Any] = {}
+        _text_block_index = 0
+        _thinking_block_index = 0
 
-        assert proc.stdout is not None
+        try:
+            async with ClaudeSDKClient(options=sdk_options) as client:
+                await client.query(prompt)
 
-        buffer = b""
-        while True:
-            chunk = await proc.stdout.read(1024 * 1024)
-            if not chunk:
-                break
-            buffer += chunk
-
-            while b"\n" in buffer:
-                line, buffer = buffer.split(b"\n", 1)
-                line_str = line.decode("utf-8").strip()
-                if not line_str:
-                    continue
-
-                try:
-                    event_data = json.loads(line_str)
-                except json.JSONDecodeError:
-                    if self.debug:
-                        logger.warning(f"[PROVIDER] Failed to parse: {line_str[:100]}")
-                    continue
-
-                event_type = event_data.get("type")
-
-                if event_type == "assistant":
-                    message = event_data.get("message", {})
-                    content_blocks = message.get("content", [])
-
-                    for block in content_blocks:
-                        block_type = block.get("type")
-
-                        if block_type == "thinking":
-                            thinking_text = block.get("thinking", "")
-                            thinking_signature = block.get("signature", "")
-                            logger.debug(
-                                f"[PROVIDER] Thinking block: {len(thinking_text)} chars"
+                async for msg in client.receive_response():
+                    if isinstance(msg, SDKAssistantMessage):
+                        if msg.error:
+                            error_labels = {
+                                "rate_limit": "Rate limit exceeded",
+                                "authentication_failed": "Authentication failed",
+                                "billing_error": "Billing error",
+                                "invalid_request": "Invalid request",
+                                "server_error": "Server error",
+                            }
+                            raise RuntimeError(
+                                f"Claude Code error: "
+                                f"{error_labels.get(msg.error, msg.error)}"
                             )
 
-                        elif block_type == "text":
-                            text_content = block.get("text", "")
-                            if response_text and text_content:
-                                response_text += "\n" + text_content
-                            else:
-                                response_text += text_content
+                        for block in msg.content:
+                            if isinstance(block, SDKTextBlock):
+                                if response_text and block.text:
+                                    response_text += "\n" + block.text
+                                else:
+                                    response_text += block.text
 
-                elif event_type == "result":
-                    result_text = event_data.get("result", "")
-                    if result_text:
-                        response_text = result_text
+                                if block.text:
+                                    if _text_block_index == 0:
+                                        await self._emit_event(
+                                            "content_block:start",
+                                            {
+                                                "provider": self.name,
+                                                "model": model,
+                                                "type": "text",
+                                                "index": _text_block_index,
+                                            },
+                                        )
+                                    await self._emit_event(
+                                        "content_block:delta",
+                                        {
+                                            "provider": self.name,
+                                            "model": model,
+                                            "type": "text",
+                                            "index": _text_block_index,
+                                            "text": block.text,
+                                        },
+                                    )
+                                    _text_block_index += 1
 
-                    usage_data = event_data.get("usage", {})
-                    session_id = event_data.get("session_id")
-                    metadata = {
-                        METADATA_SESSION_ID: session_id,
-                        METADATA_DURATION_MS: event_data.get("duration_ms"),
-                        METADATA_COST_USD: event_data.get("total_cost_usd"),
-                        "num_turns": event_data.get("num_turns"),
-                    }
+                            elif isinstance(block, SDKThinkingBlock):
+                                thinking_text = block.thinking
+                                thinking_signature = block.signature
+                                logger.debug(
+                                    f"[PROVIDER] Thinking block: {len(thinking_text)} chars"
+                                )
 
-        # Wait for process to complete
-        await proc.wait()
+                                if block.thinking:
+                                    if _thinking_block_index == 0:
+                                        await self._emit_event(
+                                            "content_block:start",
+                                            {
+                                                "provider": self.name,
+                                                "model": model,
+                                                "type": "thinking",
+                                                "index": _thinking_block_index,
+                                            },
+                                        )
+                                    await self._emit_event(
+                                        "thinking:delta",
+                                        {
+                                            "provider": self.name,
+                                            "model": model,
+                                            "index": _thinking_block_index,
+                                            "text": block.thinking,
+                                        },
+                                    )
+                                    _thinking_block_index += 1
 
-        if proc.returncode != 0:
-            stderr_data = await proc.stderr.read() if proc.stderr else b""
-            error_msg = stderr_data.decode("utf-8").strip()
+                    elif isinstance(msg, SDKResultMessage):
+                        if not response_text and msg.result:
+                            response_text = msg.result
 
-            if error_msg != "":
+                        metadata = {
+                            METADATA_SESSION_ID: msg.session_id,
+                            METADATA_DURATION_MS: msg.duration_ms,
+                            METADATA_COST_USD: msg.total_cost_usd,
+                            "num_turns": msg.num_turns,
+                        }
+                        usage_data = msg.usage or {}
+
+        except SDKCLINotFoundError as e:
+            raise RuntimeError(
+                "Claude Code CLI not found. Install with: "
+                "curl -fsSL https://claude.ai/install.sh | bash"
+            ) from e
+        except SDKProcessError as e:
+            error_msg = e.stderr or ""
+            if error_msg:
                 logger.error(f"[PROVIDER] CLI failed: {error_msg}")
                 raise RuntimeError(
-                    f"Claude Code CLI failed (exit {proc.returncode}): {error_msg}"
-                )
+                    f"Claude Code CLI failed (exit {e.exit_code}): {error_msg}"
+                ) from e
             else:
                 raise RuntimeError(
-                    f"Claude Code CLI failed (exit {proc.returncode}): Subscription limits may have been exceeded.\n"
-                    "Check subscription https://claude.ai/settings/usage and API https://platform.claude.com/settings/billing.\n"
-                    "If API billing is being used, this mean Amplifier has access to ANTHROPIC_API_KEY."
-                )
+                    f"Claude Code CLI failed (exit {e.exit_code}): "
+                    "Limits may have been exceeded.\n"
+                    "Check usage https://claude.ai/settings/usage "
+                    "and https://platform.claude.com/settings/billing.\n"
+                    "If API billing is being used, this means Amplifier "
+                    "has access to ANTHROPIC_API_KEY."
+                ) from e
+        except ClaudeSDKError as e:
+            raise RuntimeError(f"Claude Code SDK error: {e}") from e
+
+        # Close any open content block streams
+        if _thinking_block_index > 0:
+            await self._emit_event(
+                "thinking:final",
+                {
+                    "provider": self.name,
+                    "model": model,
+                    "text": thinking_text,
+                },
+            )
+            await self._emit_event(
+                "content_block:end",
+                {
+                    "provider": self.name,
+                    "model": model,
+                    "type": "thinking",
+                    "index": _thinking_block_index - 1,
+                },
+            )
+        if _text_block_index > 0:
+            await self._emit_event(
+                "content_block:end",
+                {
+                    "provider": self.name,
+                    "model": model,
+                    "type": "text",
+                    "index": _text_block_index - 1,
+                },
+            )
 
         # Parse tool calls from response text
         tool_calls = self._extract_tool_calls(response_text)
@@ -1060,10 +1054,6 @@ Tool results will be provided in <tool_result> blocks.
             "thinking": thinking_text,
             "thinking_signature": thinking_signature,
         }
-
-    # -------------------------------------------------------------------------
-    # Response building
-    # -------------------------------------------------------------------------
 
     def _extract_tool_calls(self, text: str) -> list[dict[str, Any]]:
         """Extract tool calls from response text."""
@@ -1118,41 +1108,23 @@ Tool results will be provided in <tool_result> blocks.
     def _format_json_parse_error(
         self, content: str, error: json.JSONDecodeError
     ) -> str:
-        """Format a JSON parse error with context showing where it occurred.
-
-        Args:
-            content: The JSON string that failed to parse.
-            error: The JSONDecodeError exception.
-
-        Returns:
-            Formatted error string with content excerpt and error pointer.
-        """
-        # Get error position
         pos = error.pos
         lineno = error.lineno
         colno = error.colno
 
-        # Show context around the error position
         context_before = 40
         context_after = 40
 
         start = max(0, pos - context_before)
         end = min(len(content), pos + context_after)
 
-        # Extract the excerpt
         excerpt = content[start:end]
-
-        # Calculate pointer position within excerpt
         pointer_pos = pos - start
 
-        # Build the pointer line
         pointer_line = " " * pointer_pos + "^"
-
-        # Truncation indicators
         prefix = "..." if start > 0 else ""
         suffix = "..." if end < len(content) else ""
 
-        # Build detailed error message
         lines = [
             f"JSON error at line {lineno}, column {colno}: {error.msg}",
             f"Content ({len(content)} chars total):",
@@ -1160,55 +1132,33 @@ Tool results will be provided in <tool_result> blocks.
             f"  {' ' * len(prefix)}{pointer_line}",
         ]
 
-        # If content is short enough, show the full thing
         if len(content) <= 200:
             lines.append(f"Full content: {content!r}")
 
         return "\n".join(lines)
 
     def _clean_response_text(self, text: str) -> str:
-        """Remove tool_use blocks from response text.
-
-        Args:
-            text: The response text.
-
-        Returns:
-            Cleaned text without tool_use blocks.
-        """
-        import re
-
-        # Remove tool_use blocks
         cleaned = re.sub(r"<tool_use>.*?</tool_use>", "", text, flags=re.DOTALL)
-        # Clean up extra whitespace
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+
         return cleaned.strip()
 
     def _build_response(
         self, response_data: dict[str, Any], duration: float
     ) -> ClaudeChatResponse:
-        """Build a ClaudeChatResponse from parsed response data.
+        """Build a ClaudeChatResponse from parsed response data."""
 
-        Args:
-            response_data: Parsed response from CLI.
-            duration: Request duration in seconds.
-
-        Returns:
-            ClaudeChatResponse object with content_blocks for UI compatibility.
-        """
         raw_text = response_data.get("text", "")
         tool_call_dicts = response_data.get("tool_calls", [])
         usage_data = response_data.get("usage", {})
         metadata = response_data.get("metadata", {})
 
-        # Clean response text (remove tool_use blocks)
         clean_text = self._clean_response_text(raw_text)
 
         # Build content blocks - ORDER: thinking -> text -> tool_use
         content_blocks: list[Any] = []
-        # Build event_blocks for streaming UI compatibility (like Anthropic provider)
         event_blocks: list[TextContent | ThinkingContent | ToolCallContent] = []
 
-        # Add thinking block first if present (with signature preservation)
         thinking_content = response_data.get("thinking", "")
         thinking_sig = response_data.get("thinking_signature", "")
         if thinking_content:
@@ -1219,15 +1169,12 @@ Tool results will be provided in <tool_result> blocks.
             )
             logger.debug(f"[PROVIDER] ThinkingBlock: {len(thinking_content)} chars")
             content_blocks.append(thinking_block)
-            # Add ThinkingContent for UI streaming compatibility
             event_blocks.append(ThinkingContent(text=thinking_content))
 
-        # Then text block
         if clean_text:
             content_blocks.append(TextBlock(text=clean_text))
             event_blocks.append(TextContent(text=clean_text))
 
-        # Add tool call blocks to content
         for tc in tool_call_dicts:
             content_blocks.append(
                 ToolCallBlock(
@@ -1256,15 +1203,12 @@ Tool results will be provided in <tool_result> blocks.
                 for tc in tool_call_dicts
             ]
 
-        # Build usage
         input_tokens = usage_data.get("input_tokens", 0)
         output_tokens = usage_data.get("output_tokens", 0)
         cache_read = usage_data.get("cache_read_input_tokens", 0)
         cache_creation = usage_data.get("cache_creation_input_tokens", 0)
         total_input = input_tokens + cache_read + cache_creation
 
-        # Build usage dict with cache metrics if available
-        # (matches Anthropic provider pattern - only include when non-zero)
         usage_kwargs: dict[str, Any] = {
             "input_tokens": total_input,
             "output_tokens": output_tokens,
@@ -1276,8 +1220,6 @@ Tool results will be provided in <tool_result> blocks.
             usage_kwargs["cache_read_input_tokens"] = cache_read
 
         usage = Usage(**usage_kwargs)
-
-        # Determine finish reason
         finish_reason = "tool_use" if tool_calls else "end_turn"
 
         logger.info(
@@ -1296,16 +1238,6 @@ Tool results will be provided in <tool_result> blocks.
             text=clean_text or None,
         )
 
-    # -------------------------------------------------------------------------
-    # Event emission
-    # -------------------------------------------------------------------------
-
     async def _emit_event(self, event: str, data: dict[str, Any]) -> None:
-        """Emit an event through the coordinator's hooks if available.
-
-        Args:
-            event: Event name.
-            data: Event data.
-        """
         if self.coordinator and hasattr(self.coordinator, "hooks"):
             await self.coordinator.hooks.emit(event, data)

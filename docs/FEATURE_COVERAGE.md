@@ -7,8 +7,6 @@ This document compares the Claude CLI provider (this module) with the official A
 | Aspect | Claude CLI Provider | Anthropic API Provider |
 |--------|---------------------|------------------------|
 | **Integration** | CLI subprocess | Python SDK |
-| **Authentication** | Claude subscription | API key (`ANTHROPIC_API_KEY`) |
-| **Billing** | Subscription (fixed cost) | Per-token usage |
 | **Dependencies** | Zero (CLI binary only) | `anthropic` SDK |
 | **Tool Control** | Full Control (orchestrator) | Full Control (orchestrator) |
 | **Streaming** | `stream-json` mode | Native SDK streaming |

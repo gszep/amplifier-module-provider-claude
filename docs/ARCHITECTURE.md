@@ -14,18 +14,6 @@ The Claude Code CLI doesn't expose the native `tools` parameter—it's a simplif
 2. Instructing Claude to emit `<tool_use>` XML blocks in responses
 3. Parsing those blocks to extract tool calls
 
-### Tradeoffs
-
-| Native API Tools | Text-Based Tools (This Provider) |
-|------------------|----------------------------------|
-| ✅ Structured `tool_use` content blocks | ❌ Regex parsing of XML from text |
-| ✅ Schema validation via `strict: true` | ❌ No automatic validation |
-| ✅ Advanced features (tool search, programmatic calling) | ❌ Not available |
-| ❌ Requires API key + per-token billing | ✅ Uses Claude subscription |
-| ❌ Must implement session caching | ✅ CLI handles caching automatically |
-
-**The tradeoff is intentional**: leverage Claude Code's authentication and session management at the cost of native tool use.
-
 ---
 
 ## Prompt Structure
