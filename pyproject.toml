@@ -9,6 +9,7 @@ authors = [
     { name = "Grisha Szep" },
 ]
 dependencies = [
+    "anthropic>=0.76.0",
     "claude-agent-sdk",
 ]
 

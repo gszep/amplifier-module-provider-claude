@@ -4,26 +4,18 @@ Full Control implementation using Claude Code CLI.
 Amplifier's orchestrator handles tool execution - Claude only decides which tools to call.
 """
 
-__all__ = [
-    "mount",
-    "ClaudeProvider",
-    "SessionManager",
-    "SessionMetadata",
-    "SessionState",
-]
-
+__all__ = ["mount", "ClaudeProvider"]
 __amplifier_module_type__ = "provider"
 
 import asyncio
 import json
 import logging
-import re
 import shutil
 import time
-import uuid
-from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import Any
 
+import claude_agent_sdk  # type: ignore
 from amplifier_core import (  # type: ignore
     ModelInfo,
     ModuleCoordinator,
@@ -43,140 +35,35 @@ from amplifier_core.message_models import (  # type: ignore
     Usage,
 )
 from amplifier_core.utils import truncate_values
-from claude_agent_sdk import ClaudeSDKClient  # type: ignore[import-untyped]
-from claude_agent_sdk._errors import (  # type: ignore[import-untyped]
-    ClaudeSDKError,
-)
-from claude_agent_sdk._errors import (
-    CLINotFoundError as SDKCLINotFoundError,
-)
-from claude_agent_sdk._errors import (
-    ProcessError as SDKProcessError,
-)
-from claude_agent_sdk.types import (  # type: ignore[import-untyped]
-    AssistantMessage as SDKAssistantMessage,
-)
-from claude_agent_sdk.types import (
-    ClaudeAgentOptions,
-)
-from claude_agent_sdk.types import (
-    ResultMessage as SDKResultMessage,
-)
-from claude_agent_sdk.types import (
-    TextBlock as SDKTextBlock,
-)
-from claude_agent_sdk.types import (
-    ThinkingBlock as SDKThinkingBlock,
-)
+from anthropic.types import TextBlock as AnthropicTextBlock
+from anthropic.types import ThinkingBlock as AnthropicThinkingBlock
+from anthropic.types import ToolUseBlock as AnthropicToolUseBlock
+from anthropic.types.message import Message as AnthropicMessage
+from anthropic.types.usage import Usage as AnthropicUsage
+from claude_agent_sdk import ClaudeSDKClient  # type: ignore
+from claude_agent_sdk.types import ClaudeAgentOptions  # type: ignore
 
-from .sessions import SessionManager, SessionMetadata, SessionState
+from .sessions import SessionManager
 
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class WebSearchContent:
+    """Content block for web search results from native Anthropic web search."""
+
+    type: str = "web_search"
+    query: str = ""
+    results: list[dict[str, Any]] = field(default_factory=list)
+    citations: list[dict[str, str]] = field(default_factory=list)
+
+
 class ClaudeChatResponse(ChatResponse):
-    content_blocks: list[TextContent | ThinkingContent | ToolCallContent] | None = None
+    content_blocks: (
+        list[TextContent | ThinkingContent | ToolCallContent | WebSearchContent] | None
+    ) = None
     text: str | None = None
-
-
-class ClaudeProviderError(Exception):
-    def __init__(
-        self,
-        message: str,
-        *,
-        error_type: str = "unknown",
-        is_recoverable: bool = False,
-        details: dict[str, Any] | None = None,
-    ):
-        super().__init__(message)
-        self.error_type = error_type
-        self.is_recoverable = is_recoverable
-        self.details = details or {}
-
-    def __str__(self) -> str:
-        return f"{self.error_type}: {super().__str__()}"
-
-
-class ContextLimitExceededError(ClaudeProviderError):
-    def __init__(
-        self,
-        message: str = "Prompt is too long",
-        details: dict[str, Any] | None = None,
-    ):
-        super().__init__(
-            message,
-            error_type="context_limit_exceeded",
-            is_recoverable=False,
-            details=details,
-        )
-
-
-class RateLimitError(ClaudeProviderError):
-    def __init__(
-        self,
-        message: str = "Rate limit exceeded",
-        details: dict[str, Any] | None = None,
-    ):
-        super().__init__(
-            message,
-            error_type="rate_limit",
-            is_recoverable=True,
-            details=details,
-        )
-
-
-class InvalidRequestError(ClaudeProviderError):
-    def __init__(
-        self,
-        message: str,
-        details: dict[str, Any] | None = None,
-    ):
-        super().__init__(
-            message,
-            error_type="invalid_request",
-            is_recoverable=False,
-            details=details,
-        )
-
-
-METADATA_SESSION_ID = "claude:session_id"
-METADATA_COST_USD = "claude:cost_usd"
-METADATA_DURATION_MS = "claude:duration_ms"
-
-DEFAULT_MODEL = "sonnet"
-DEFAULT_TIMEOUT = 300.0
-DEFAULT_MAX_TOKENS = 64000
-DEFAULT_MAX_THINKING_TOKENS = 10240  # 10K thinking budget - good middle ground
-MIN_THINKING_TOKENS = 1024  # API minimum
-
-# Model specifications
-MODELS = {
-    "sonnet": {
-        "id": "sonnet",
-        "display_name": "Claude Sonnet",
-        "context_window": 200000,
-        "max_output_tokens": 64000,
-        "capabilities": ["tools", "streaming", "thinking"],
-    },
-    "opus": {
-        "id": "opus",
-        "display_name": "Claude Opus",
-        "context_window": 200000,
-        "max_output_tokens": 64000,
-        "capabilities": ["tools", "streaming", "thinking"],
-    },
-    "haiku": {
-        "id": "haiku",
-        "display_name": "Claude Haiku",
-        "context_window": 200000,
-        "max_output_tokens": 64000,
-        "capabilities": [
-            "tools",
-            "streaming",
-            "thinking",
-        ],  # Haiku 4.5 supports thinking
-    },
-}
+    web_search_results: list[dict[str, Any]] | None = None
 
 
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
@@ -202,7 +89,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 
     provider = ClaudeProvider(config=config, coordinator=coordinator)
     await coordinator.mount("providers", provider, name="claude")
-    logger.info("Mounted ClaudeProvider (Claude Code CLI - Full Control mode)")
+    logger.info("Mounted ClaudeProvider")
 
     async def cleanup():
         try:
@@ -237,15 +124,25 @@ class ClaudeProvider:
         self.config = config or {}
         self.coordinator = coordinator
 
-        self.default_model = self.config.get("default_model", DEFAULT_MODEL)
-        self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
-        self.debug = self.config.get("debug", False)
-        self.raw_debug = self.config.get("raw_debug", False)
-        self.debug_truncate_length = self.config.get("debug_truncate_length", 180)
-        self.max_thinking_tokens = max(
-            MIN_THINKING_TOKENS,
-            self.config.get("max_thinking_tokens", DEFAULT_MAX_THINKING_TOKENS),
-        )
+        self.default_model: str = self.config.get("default_model", "sonnet")
+        self.temperature: float = self.config.get("temperature", 1.0)  # thinking
+        self.enable_prompt_caching = True  # always enable prompt caching
+
+        self._beta_headers: list[str] = []
+        self.context_window = 200000  # beta-headers: 1m context not available
+
+        self.max_tokens: int = self.config.get("max_tokens", 64000)
+        self.max_output_tokens: int = 64000  # claude models support 64K output
+        self.max_thinking_tokens: int = self.config.get("max_thinking_tokens", 32000)
+
+        self.priority: int = self.config.get("priority", 100)
+        self.debug: bool = self.config.get("debug", False)
+        self.raw_debug: bool = self.config.get("raw_debug", False)
+        self.debug_truncate_length: int = self.config.get("debug_truncate_length", 180)
+
+        self.timeout: float = self.config.get("timeout", 300.0)
+        self.use_streaming = True  # sdk only supports streaming
+        self.enable_web_search: bool = self.config.get("enable_web_search", False)
 
         self._repaired_tool_ids: set[str] = set()
         self._session_manager = SessionManager(
@@ -261,47 +158,8 @@ class ClaudeProvider:
         self._valid_tool_names: set[str] = set()
         self._filtered_tool_calls: list[dict[str, Any]] = []
 
-    def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
-        """Recursively truncate string values in nested structures.
-
-        Delegates to shared utility from amplifier_core.utils.
-        """
-        if max_length is None:
-            max_length = self.debug_truncate_length
-        return truncate_values(obj, max_length)
-
-    def _get_amplifier_session_id(self) -> str | None:
-        """Get the Amplifier session ID from the coordinator.
-
-        Returns:
-            Session ID string if available, None otherwise.
-        """
-        if not self.coordinator:
-            return None
-
-        if hasattr(self.coordinator, "session"):
-            session = getattr(self.coordinator, "session", None)
-            if session and hasattr(session, "id"):
-                return str(session.id)
-
-        if hasattr(self.coordinator, "config"):
-            config = getattr(self.coordinator, "config", {})
-            if isinstance(config, dict) and "session_id" in config:
-                return str(config["session_id"])
-
-        return None
-
-    def _get_claude_session_id(self) -> str | None:
-        return self._session_state.metadata.claude_session_id
-
-    def _save_session(self) -> None:
-        self._session_manager.save_session(self._session_state)
-        if self.debug:
-            efficiency = self._session_state.get_cache_efficiency()
-            logger.debug(
-                f"[PROVIDER] Session saved: {self._session_state.metadata.session_id}, "
-                f"cache efficiency: {efficiency:.1%}"
-            )
+        self._tool_results: set[str] = set()
+        self._session_id: str | None = None
 
     def get_info(self) -> ProviderInfo:
         return ProviderInfo(
@@ -311,8 +169,11 @@ class ClaudeProvider:
             capabilities=["streaming", "tools", "thinking"],
             defaults={
                 "model": self.default_model,
-                "max_tokens": DEFAULT_MAX_TOKENS,
+                "max_tokens": self.max_tokens,
+                "temperature": self.temperature,
                 "timeout": self.timeout,
+                "context_window": self.context_window,
+                "max_output_tokens": self.max_output_tokens,
             },
             config_fields=[],
         )
@@ -320,48 +181,48 @@ class ClaudeProvider:
     async def list_models(self) -> list[ModelInfo]:
         return [
             ModelInfo(
-                id=spec["id"],
-                display_name=spec["display_name"],
-                context_window=spec["context_window"],
-                max_output_tokens=spec["max_output_tokens"],
-                capabilities=spec["capabilities"],
-                defaults={"temperature": 1.0}
-                if "thinking" in spec["capabilities"]
-                else {},
-            )
-            for spec in MODELS.values()
+                id="sonnet",
+                display_name="Claude Sonnet",
+                context_window=self.context_window,
+                max_output_tokens=self.max_output_tokens,
+                capabilities=["tools", "thinking", "streaming", "json_mode"],
+                defaults={
+                    "temperature": self.temperature,
+                    "max_tokens": self.max_tokens,
+                },
+            ),
+            ModelInfo(
+                id="opus",
+                display_name="Claude Opus",
+                context_window=self.context_window,
+                max_output_tokens=self.max_output_tokens,
+                capabilities=["tools", "thinking", "streaming", "json_mode"],
+                defaults={
+                    "temperature": self.temperature,
+                    "max_tokens": self.max_tokens,
+                },
+            ),
+            ModelInfo(
+                id="haiku",
+                display_name="Claude  Haiku",
+                context_window=self.context_window,
+                max_output_tokens=self.max_output_tokens,
+                capabilities=["tools", "streaming", "json_mode", "fast"],
+                defaults={
+                    "temperature": self.temperature,
+                    "max_tokens": self.max_tokens,
+                },
+            ),
         ]
 
-    def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
-        """Parse tool calls from response.
+    def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
+        """Recursively truncate string values in nested structures.
 
-        Tool calls are extracted in complete() and placed in response.tool_calls.
-        Filters out tool calls with empty/missing arguments to handle
-        Claude API quirk where empty tool_use blocks are sometimes generated.
-
-        Args:
-            response: The ChatResponse to extract tool calls from.
-
-        Returns:
-            List of valid tool calls (with non-empty arguments).
+        Delegates to shared utility from amplifier_core.utils.
         """
-        if not response.tool_calls:
-            return []
-
-        valid_calls = []
-        for tc in response.tool_calls:
-            # Skip tool calls with no arguments or empty dict
-            if not tc.arguments:
-                logger.debug(f"Filtering out tool '{tc.name}' with empty arguments")
-                continue
-            valid_calls.append(tc)
-
-        if len(valid_calls) < len(response.tool_calls):
-            logger.info(
-                f"Filtered {len(response.tool_calls) - len(valid_calls)} tool calls with empty arguments"
-            )
-
-        return valid_calls
+        if max_length is None:
+            max_length = self.debug_truncate_length
+        return truncate_values(obj, max_length)
 
     def _find_missing_tool_results(
         self, messages: list[Message]
@@ -409,39 +270,26 @@ class ClaudeProvider:
         )
 
     async def complete(self, request: ChatRequest, **kwargs: Any) -> ChatResponse:
-        """Execute a completion request via Claude Code CLI.
-
-        Full Control mode: Returns tool_calls for Amplifier to execute.
+        """
+        Generate completion from ChatRequest.
 
         Args:
-            request: The chat request with messages and tools.
-            **kwargs: Additional arguments (model override, etc.).
+            request: Typed chat request with messages, tools, config
+            **kwargs: Provider-specific options (override request fields)
 
         Returns:
-            ChatResponse with content and optional tool_calls.
-
-        Raises:
-            RuntimeError: If CLI is not found or fails.
+            ChatResponse with content blocks, tool calls, usage
         """
-
-        self._valid_tool_names = set()
-        if request.tools:
-            for tool in request.tools:
-                if hasattr(tool, "name"):
-                    self._valid_tool_names.add(tool.name)
-                elif isinstance(tool, dict) and "name" in tool:
-                    self._valid_tool_names.add(tool["name"])
-
-        previous_filtered_calls = self._filtered_tool_calls.copy()
-        self._filtered_tool_calls = []
-
         missing = self._find_missing_tool_results(request.messages)
+
         if missing:
             logger.warning(
-                f"[PROVIDER] Claude: Detected {len(missing)} missing tool result(s). "
+                f"[PROVIDER] Anthropic: Detected {len(missing)} missing tool result(s). "
                 f"Injecting synthetic errors. This indicates a bug in context management. "
                 f"Tool IDs: {[call_id for _, call_id, _, _ in missing]}"
             )
+
+            from collections import defaultdict
 
             by_msg_idx: dict[int, list[tuple[str, str]]] = defaultdict(list)
             for msg_idx, call_id, tool_name, _ in missing:
@@ -470,774 +318,1325 @@ class ClaudeProvider:
                     },
                 )
 
-        for tool_call in previous_filtered_calls:
-            request.messages.append(
-                Message(
-                    role="tool",
-                    content=(
-                        f"[SYSTEM NOTICE: Tool call rejected]\n\n"
-                        f"Tool: {tool_call['name']}\n"
-                        f"is not available in the current context and cannot be called.\n"
-                        f"Please acknowledge this error and offer to retry the operation."
-                    ),
-                    tool_call_id=tool_call["id"],
-                    name=tool_call["name"],
-                )
-            )
+        return await self._complete_chat_request(request, **kwargs)
 
-        if previous_filtered_calls:
-            logger.info(
-                f"[PROVIDER] Injected feedback about {len(previous_filtered_calls)} "
-                f"filtered tool calls from previous turn."
-            )
+    def _format_system_with_cache(
+        self, system_msgs: list[Message]
+    ) -> list[dict[str, Any]] | None:
+        """Format system messages as content block array with cache_control.
 
-        start_time = time.time()
-        model = (
-            kwargs.get("model") or getattr(request, "model", None) or self.default_model
+        Anthropic requires system as array of content blocks for caching.
+        Cache breakpoint goes on the LAST block.
+
+        Returns:
+            List of content blocks, or None if no system messages
+        """
+        if not system_msgs:
+            return None
+
+        # Combine into single text (preserves current behavior)
+        combined = "\n\n".join(
+            m.content if isinstance(m.content, str) else "" for m in system_msgs
         )
+
+        if not combined:
+            return None
+
+        block: dict[str, Any] = {"type": "text", "text": combined}
+
+        # Add cache_control if enabled
+        if self.enable_prompt_caching:
+            block["cache_control"] = {"type": "ephemeral"}
+
+        return [block]
+
+    async def _complete_chat_request(
+        self, request: ChatRequest, **kwargs
+    ) -> ChatResponse:
+        """Handle ChatRequest format with developer message conversion.
+
+        Args:
+            request: ChatRequest with messages
+            **kwargs: Additional parameters
+
+        Returns:
+            ChatResponse with content blocks
+        """
 
         request_metadata = getattr(request, "metadata", None) or {}
-        existing_session_id = (
-            request_metadata.get(METADATA_SESSION_ID) or self._get_claude_session_id()
+        self._session_id = request_metadata.get(
+            "claude:session_id", self._get_claude_session_id()
         )
 
-        resuming = existing_session_id is not None
-        system_prompt, user_prompt = self._convert_messages(
-            request.messages, request.tools, resuming=resuming
+        logger.debug(
+            f"Received ChatRequest with {len(request.messages)} messages (debug={self.debug})"
         )
 
-        if system_prompt:
-            full_prompt = f"{system_prompt}\n\n{user_prompt}"
+        # Separate messages by role
+        system_msgs = [m for m in request.messages if m.role == "system"]
+        developer_msgs = [m for m in request.messages if m.role == "developer"]
+        conversation = [
+            m for m in request.messages if m.role in ("user", "assistant", "tool")
+        ]
+
+        logger.debug(
+            f"Separated: {len(system_msgs)} system, {len(developer_msgs)} developer, {len(conversation)} conversation"
+        )
+
+        # Format system messages as content block array (required for caching)
+        system_blocks = self._format_system_with_cache(system_msgs)
+
+        if system_blocks:
+            logger.info(
+                f"[PROVIDER] System message length: {len(system_blocks[0]['text'])} chars (caching={'cache_control' in system_blocks[0]})"
+            )
         else:
-            full_prompt = user_prompt
+            logger.info("[PROVIDER] No system messages")
 
-        if self.debug:
-            logger.debug(f"[PROVIDER] System prompt length: {len(system_prompt)}")
-            logger.debug(f"[PROVIDER] User prompt: {user_prompt[:200]}...")
+        # Convert developer messages to XML-wrapped user messages (at top)
+        context_user_msgs = []
+        for i, dev_msg in enumerate(developer_msgs):
+            content = dev_msg.content if isinstance(dev_msg.content, str) else ""
+            content_preview = content[:100] + ("..." if len(content) > 100 else "")
+            logger.info(
+                f"[PROVIDER] Converting developer message {i + 1}/{len(developer_msgs)}: length={len(content)}"
+            )
+            logger.debug(f"[PROVIDER] Developer message preview: {content_preview}")
+            wrapped = f"<context_file>\n{content}\n</context_file>"
+            context_user_msgs.append({"role": "user", "content": wrapped})
 
-        # Emit request events
-        await self._emit_event(
-            "llm:request",
-            {
-                "provider": self.name,
-                "model": model,
-                "messages_count": len(request.messages),
-                "tools_count": len(request.tools) if request.tools else 0,
-                "resume_session": existing_session_id is not None,
-            },
+        logger.info(
+            f"[PROVIDER] Created {len(context_user_msgs)} XML-wrapped context messages"
         )
 
-        # DEBUG level: Request details with truncated values
-        if self.debug:
-            await self._emit_event(
-                "llm:request:debug",
+        # Convert conversation messages
+        conversation_msgs = self._convert_messages(
+            [m.model_dump() for m in conversation]
+        )
+        logger.info(
+            f"[PROVIDER] Converted {len(conversation_msgs)} conversation messages"
+        )
+
+        # Combine: context THEN conversation
+        all_messages = context_user_msgs + conversation_msgs
+        # Apply cache control to last message for incremental context caching
+        all_messages = self._apply_message_cache_control(all_messages)
+        logger.info(f"[PROVIDER] Final message count for API: {len(all_messages)}")
+
+        # Prepare request parameters
+        params = {
+            "model": kwargs.get("model", self.default_model),
+            "messages": all_messages,
+            "max_tokens": request.max_output_tokens
+            or kwargs.get("max_tokens", self.max_tokens),
+            "temperature": request.temperature
+            or kwargs.get("temperature", self.temperature),
+        }
+
+        if system_blocks:
+            params["system"] = system_blocks
+
+        # Add tools if provided
+        if request.tools:
+            tools = self._convert_tools_from_request(request.tools)
+            params["tools"] = self._apply_tool_cache_control(tools)
+            # Add tool_choice if specified
+            if tool_choice := kwargs.get("tool_choice"):
+                params["tool_choice"] = tool_choice
+
+        # Add native web search tool if enabled (via config or kwargs)
+        # This is a model-native tool that doesn't need function conversion
+        web_search_enabled = kwargs.get("enable_web_search", self.enable_web_search)
+        if web_search_enabled:
+            web_search_tool = self._build_web_search_tool(kwargs)
+            if "tools" not in params:
+                params["tools"] = []
+            # Add web search tool at the beginning (native tools typically come first)
+            params["tools"].insert(0, web_search_tool)
+            logger.info("[PROVIDER] Native web search tool enabled")
+
+        # Enable extended thinking if requested (equivalent to OpenAI's reasoning)
+        thinking_enabled = bool(kwargs.get("extended_thinking"))
+        thinking_budget = None
+        interleaved_thinking_enabled = False
+        if thinking_enabled:
+            budget_tokens = (
+                kwargs.get("thinking_budget_tokens")
+                or self.config.get("thinking_budget_tokens")
+                or 32000
+            )
+            buffer_tokens = kwargs.get("thinking_budget_buffer") or self.config.get(
+                "thinking_budget_buffer", 4096
+            )
+
+            thinking_budget = budget_tokens
+            params["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": budget_tokens,
+            }
+
+            # CRITICAL: Anthropic requires temperature=1.0 when thinking is enabled
+            params["temperature"] = 1.0
+
+            # Ensure max_tokens accommodates thinking budget + response
+            target_tokens = budget_tokens + buffer_tokens
+            if params.get("max_tokens"):
+                params["max_tokens"] = max(params["max_tokens"], target_tokens)
+            else:
+                params["max_tokens"] = target_tokens
+
+            # Auto-enable interleaved thinking when extended thinking is enabled.
+            # Interleaved thinking allows Claude 4 models to think between tool calls,
+            # producing better reasoning on complex multi-step tasks.
+            # Uses the beta header: interleaved-thinking-2025-05-14
+            #
+            # IMPORTANT: We must merge with the instance's configured beta headers
+            # (e.g., context-1m-2025-08-07 for 1M context window). The extra_headers
+            # in params will override the client's default_headers for the same key,
+            # so we need to include ALL beta headers in the combined value.
+            interleaved_thinking_enabled = True
+            combined_beta_headers = list(
+                self._beta_headers
+            )  # Start with configured headers
+            if "interleaved-thinking-2025-05-14" not in combined_beta_headers:
+                combined_beta_headers.append("interleaved-thinking-2025-05-14")
+            params["extra_headers"] = {
+                "anthropic-beta": ",".join(combined_beta_headers)
+            }
+
+            logger.info(
+                "[PROVIDER] Extended thinking enabled (budget=%s, buffer=%s, temperature=1.0, max_tokens=%s, interleaved=%s)",
+                thinking_budget,
+                buffer_tokens,
+                params["max_tokens"],
+                interleaved_thinking_enabled,
+            )
+
+        # Add stop_sequences if specified
+        if stop_sequences := kwargs.get("stop_sequences"):
+            params["stop_sequences"] = stop_sequences
+
+        logger.info(
+            f"[PROVIDER] Anthropic API call - model: {params['model']}, messages: {len(params['messages'])}, system: {bool(system_blocks)}, tools: {len(params.get('tools', []))}, thinking: {thinking_enabled}"
+        )
+
+        # Emit llm:request event
+        if self.coordinator and hasattr(self.coordinator, "hooks"):
+            # INFO level: Summary only
+            await self.coordinator.hooks.emit(
+                "llm:request",
                 {
-                    "lvl": "DEBUG",
-                    "provider": self.name,
-                    "request": self._truncate_values(
-                        {
-                            "model": model,
-                            "prompt_length": len(full_prompt),
-                            "resume_session": existing_session_id,
-                            "tools_count": len(request.tools) if request.tools else 0,
-                            "max_thinking_tokens": self.max_thinking_tokens,
-                        }
-                    ),
+                    "provider": "anthropic",
+                    "model": params["model"],
+                    "message_count": len(params["messages"]),
+                    "has_system": bool(system_blocks),
+                    "thinking_enabled": thinking_enabled,
+                    "thinking_budget": thinking_budget,
+                    "interleaved_thinking": interleaved_thinking_enabled,
                 },
             )
 
-        # RAW level: Complete prompt as sent to CLI
-        if self.debug and self.raw_debug:
-            await self._emit_event(
-                "llm:request:raw",
-                {
-                    "lvl": "DEBUG",
-                    "provider": self.name,
-                    "prompt": full_prompt,
-                    "model": model,
-                    "session_id": existing_session_id,
-                },
-            )
-
-        try:
-            async with asyncio.timeout(self.timeout):
-                response_data = await self._execute_sdk_query(
-                    full_prompt, model, existing_session_id
+            # DEBUG level: Full request payload with truncated values (if debug enabled)
+            if self.debug:
+                await self.coordinator.hooks.emit(
+                    "llm:request:debug",
+                    {
+                        "lvl": "DEBUG",
+                        "provider": "anthropic",
+                        "request": self._truncate_values(params),
+                    },
                 )
+
+            # RAW level: Complete params dict as sent to Anthropic API (if debug AND raw_debug enabled)
+            if self.debug and self.raw_debug:
+                await self.coordinator.hooks.emit(
+                    "llm:request:raw",
+                    {
+                        "lvl": "DEBUG",
+                        "provider": "anthropic",
+                        "params": params,  # Complete untruncated params
+                    },
+                )
+
+        start_time = time.time()
+
+        rate_limit_info: dict[str, Any] = {}
+
+        async with asyncio.timeout(self.timeout):
+            async with ClaudeSDKClient(
+                options=ClaudeAgentOptions(
+                    tools=[],  # disable built-in tools
+                    model=self.default_model,
+                    resume=self._session_id,
+                    system_prompt="---",  # system prompt is passed in messages
+                    max_thinking_tokens=self.max_thinking_tokens,
+                )
+            ) as client:
+                prompt = self._convert_prompt_from_request_params(params)
+                await client.query(prompt)
+                response = await self._parse_response(client)
+
+        # If we get here, request succeeded - continue with response handling
+        try:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+
+            logger.info("[PROVIDER] Received response from Anthropic API")
+            logger.debug(f"[PROVIDER] Response type: {response.model}")
+
+            # Log rate limit status if available
+            if rate_limit_info:
+                tokens_remaining = rate_limit_info.get("tokens_remaining")
+                tokens_limit = rate_limit_info.get("tokens_limit")
+                if tokens_remaining is not None and tokens_limit is not None:
+                    pct_used = (
+                        ((tokens_limit - tokens_remaining) / tokens_limit) * 100
+                        if tokens_limit > 0
+                        else 0
+                    )
+                    logger.debug(
+                        f"[PROVIDER] Rate limit: {tokens_remaining:,}/{tokens_limit:,} tokens remaining ({pct_used:.1f}% used)"
+                    )
+
+            # Emit llm:response event
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                # INFO level: Summary with rate limit info
+                response_event: dict[str, Any] = {
+                    "provider": "anthropic",
+                    "model": params["model"],
+                    "usage": {
+                        "input": response.usage.input_tokens,
+                        "output": response.usage.output_tokens,
+                        **(
+                            {"cache_read": response.usage.cache_read_input_tokens}
+                            if hasattr(response.usage, "cache_read_input_tokens")
+                            and response.usage.cache_read_input_tokens
+                            else {}
+                        ),
+                        **(
+                            {"cache_write": response.usage.cache_creation_input_tokens}
+                            if hasattr(response.usage, "cache_creation_input_tokens")
+                            and response.usage.cache_creation_input_tokens
+                            else {}
+                        ),
+                    },
+                    "status": "ok",
+                    "duration_ms": elapsed_ms,
+                }
+                # Add rate limit info if available
+                if rate_limit_info:
+                    response_event["rate_limits"] = rate_limit_info
+
+                await self.coordinator.hooks.emit("llm:response", response_event)
+
+                # DEBUG level: Full response with truncated values (if debug enabled)
+                if self.debug:
+                    response_dict = response.model_dump()  # Pydantic model → dict
+                    await self.coordinator.hooks.emit(
+                        "llm:response:debug",
+                        {
+                            "lvl": "DEBUG",
+                            "provider": "anthropic",
+                            "response": self._truncate_values(response_dict),
+                            "status": "ok",
+                            "duration_ms": elapsed_ms,
+                        },
+                    )
+
+                # RAW level: Complete response object from Anthropic API (if debug AND raw_debug enabled)
+                if self.debug and self.raw_debug:
+                    await self.coordinator.hooks.emit(
+                        "llm:response:raw",
+                        {
+                            "lvl": "DEBUG",
+                            "provider": "anthropic",
+                            "response": response.model_dump(),  # Complete untruncated response
+                        },
+                    )
+
+            # Convert to ChatResponse
+            return self._convert_to_chat_response(response)
+
         except TimeoutError:
+            # Handle timeout specifically - TimeoutError has empty str() representation
             elapsed_ms = int((time.time() - start_time) * 1000)
             error_msg = f"Request timed out after {self.timeout}s"
-            logger.error(f"[PROVIDER] {error_msg}")
-            await self._emit_event(
-                "llm:response",
-                {
-                    "provider": self.name,
-                    "model": model,
-                    "status": "error",
-                    "duration_ms": elapsed_ms,
-                    "error": error_msg,
-                },
-            )
+            logger.error(f"[PROVIDER] Anthropic API error: {error_msg}")
+
+            # Emit error event
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "provider": "anthropic",
+                        "model": params["model"],
+                        "status": "error",
+                        "duration_ms": elapsed_ms,
+                        "error": error_msg,
+                    },
+                )
             raise TimeoutError(error_msg) from None
+
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
+            # Ensure error message is never empty
             error_msg = str(e) or f"{type(e).__name__}: (no message)"
-            logger.error(f"[PROVIDER] Claude error: {error_msg}")
-            await self._emit_event(
-                "llm:response",
-                {
-                    "provider": self.name,
-                    "model": model,
-                    "status": "error",
-                    "duration_ms": elapsed_ms,
-                    "error": error_msg,
-                },
-            )
+            logger.error(f"[PROVIDER] Anthropic API error: {error_msg}")
+
+            # Emit error event
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "provider": "anthropic",
+                        "model": params["model"],
+                        "status": "error",
+                        "duration_ms": elapsed_ms,
+                        "error": error_msg,
+                    },
+                )
+            # Re-raise with meaningful message if original was empty
             if not str(e):
                 raise type(e)(error_msg) from e
             raise
 
-        response_session_id = response_data.get("metadata", {}).get(METADATA_SESSION_ID)
-        if response_session_id:
-            self._session_state.set_claude_session_id(response_session_id)
-            logger.debug(
-                f"[PROVIDER] Stored session ID for resumption: {response_session_id}"
+    def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
+        """Parse tool calls from response.
+
+        Tool calls are extracted in complete() and placed in response.tool_calls.
+        Filters out tool calls with empty/missing arguments to handle
+        Claude API quirk where empty tool_use blocks are sometimes generated.
+
+        Args:
+            response: The ChatResponse to extract tool calls from.
+
+        Returns:
+            List of valid tool calls (with non-empty arguments).
+        """
+        if not response.tool_calls:
+            return []
+
+        valid_calls = []
+        for tc in response.tool_calls:
+            # Skip tool calls with no arguments or empty dict
+            if not tc.arguments:
+                logger.debug(f"Filtering out tool '{tc.name}' with empty arguments")
+                continue
+            valid_calls.append(tc)
+
+        if len(valid_calls) < len(response.tool_calls):
+            logger.info(
+                f"Filtered {len(response.tool_calls) - len(valid_calls)} tool calls with empty arguments"
             )
 
-        duration = time.time() - start_time
-        chat_response = self._build_response(response_data, duration)
+        return valid_calls
 
-        usage_data = response_data.get("usage", {})
-        self._session_state.update_usage(
-            input_tokens=usage_data.get("input_tokens", 0),
-            output_tokens=usage_data.get("output_tokens", 0),
-            cache_read=usage_data.get("cache_read_input_tokens", 0),
-            cache_creation=usage_data.get("cache_creation_input_tokens", 0),
-            cost_usd=response_data.get("metadata", {}).get(METADATA_COST_USD, 0.0)
-            or 0.0,
-            duration_ms=int(duration * 1000),
-        )
-        self._save_session()
+    def _clean_content_block(self, block: dict[str, Any]) -> dict[str, Any]:
+        """Clean a content block for API by removing fields not accepted by Anthropic API.
 
-        # Emit response events
-        await self._emit_event(
-            "llm:response",
-            {
-                "provider": self.name,
-                "model": model,
-                "status": "ok",
-                "duration_ms": int(duration * 1000),
-                "usage": {
-                    "input": chat_response.usage.input_tokens
-                    if chat_response.usage
-                    else 0,
-                    "output": chat_response.usage.output_tokens
-                    if chat_response.usage
-                    else 0,
-                },
-                "has_tool_calls": bool(chat_response.tool_calls),
-                "tool_calls_count": len(chat_response.tool_calls)
-                if chat_response.tool_calls
-                else 0,
-            },
-        )
+        Anthropic API may include extra fields (like 'visibility') in responses,
+        but does NOT accept these fields when blocks are sent as input in messages.
 
-        # DEBUG level: Full response with truncated values
-        if self.debug:
-            await self._emit_event(
-                "llm:response:debug",
-                {
-                    "lvl": "DEBUG",
-                    "provider": self.name,
-                    "response": self._truncate_values(response_data),
-                    "status": "ok",
-                    "duration_ms": int(duration * 1000),
-                },
-            )
+        Args:
+            block: Raw content block dict (may include visibility, etc.)
 
-        # RAW level: Complete response data
-        if self.debug and self.raw_debug:
-            await self._emit_event(
-                "llm:response:raw",
-                {
-                    "lvl": "DEBUG",
-                    "provider": self.name,
-                    "response": response_data,
-                },
-            )
+        Returns:
+            Cleaned content block dict with only API-accepted fields
+        """
+        block_type = block.get("type")
 
-        return chat_response
+        if block_type == "text":
+            return {"type": "text", "text": block.get("text", "")}
+        if block_type == "thinking":
+            cleaned = {"type": "thinking", "thinking": block.get("thinking", "")}
+            if "signature" in block:
+                cleaned["signature"] = block["signature"]
+            return cleaned
+        if block_type == "tool_use":
+            return {
+                "type": "tool_use",
+                "id": block.get("id", ""),
+                "name": block.get("name", ""),
+                "input": block.get("input", {}),
+            }
+        if block_type == "tool_result":
+            return {
+                "type": "tool_result",
+                "tool_use_id": block.get("tool_use_id", ""),
+                "content": block.get("content", ""),
+            }
+        if block_type == "web_search_tool_result":
+            # Web search results are model-native and should be passed through
+            # with minimal cleaning (just remove internal fields)
+            cleaned: dict[str, Any] = {
+                "type": "web_search_tool_result",
+            }
+            if "tool_use_id" in block:
+                cleaned["tool_use_id"] = block["tool_use_id"]
+            if "content" in block:
+                cleaned["content"] = block["content"]
+            return cleaned
+        # Unknown block type - return as-is but remove visibility
+        cleaned = dict(block)
+        cleaned.pop("visibility", None)
+        return cleaned
 
-    def _convert_messages(
-        self,
-        messages: list[Message],
-        tools: list[Any] | None,
-        resuming: bool = False,
-    ) -> tuple[str, str]:
-        system_parts = []
-        conversation_parts = []
-        tool_schema = ""
+    def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Convert messages to Anthropic format.
 
-        if resuming:
-            messages = self._get_current_turn_messages(messages)
-        else:
-            if tools:
-                tool_definitions = self._convert_tools(tools)
-                tool_schema = self._build_tool_schema(tool_definitions)
+        CRITICAL: Anthropic requires ALL tool_result blocks from one assistant's tool_use
+        to be batched into a SINGLE user message with multiple tool_result blocks in the
+        content array. We cannot send separate user messages for each tool result.
 
+        This method batches consecutive tool messages into one user message.
+
+        DEFENSIVE: Also validates that each tool_result has a corresponding tool_use
+        in a preceding assistant message. Orphaned tool_results (from context compaction)
+        are skipped to avoid API errors.
+        """
+        # First pass: collect all valid tool_use_ids from assistant messages
+        valid_tool_use_ids: set[str] = set()
         for msg in messages:
-            role = msg.role
-            content = self._extract_content(msg)
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tc in msg.get("tool_calls", []):
+                    tc_id = tc.get("id") or tc.get("tool_call_id")
+                    if tc_id:
+                        valid_tool_use_ids.add(tc_id)
 
+        anthropic_messages = []
+        i = 0
+
+        while i < len(messages):
+            msg = messages[i]
+            role = msg.get("role")
+            content = msg.get("content", "")
+
+            # Skip system messages (handled separately)
             if role == "system":
-                if not resuming:
-                    system_parts.append(f"<system-reminder>{content}</system-reminder>")
+                i += 1
+                continue
 
-            elif role == "user":
-                if content.strip().startswith("<system-reminder"):
-                    conversation_parts.append(content)
+            # Batch consecutive tool messages into ONE user message
+            if role == "tool":
+                # Collect all consecutive tool results, but only valid ones
+                tool_results = []
+                skipped_count = 0
+                while i < len(messages) and messages[i].get("role") == "tool":
+                    tool_msg = messages[i]
+                    tool_use_id = tool_msg.get("tool_call_id")
+
+                    # DEFENSIVE: Skip tool_results without valid tool_use_id
+                    # This prevents API errors from orphaned tool_results after compaction
+                    if not tool_use_id or tool_use_id not in valid_tool_use_ids:
+                        logger.warning(
+                            f"Skipping orphaned tool_result (no matching tool_use): "
+                            f"tool_call_id={tool_use_id}, content_preview={str(tool_msg.get('content', ''))[:100]}"
+                        )
+                        skipped_count += 1
+                        i += 1
+                        continue
+
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": tool_msg.get("content", ""),
+                        }
+                    )
+                    i += 1
+
+                # Only add user message if we have valid tool_results
+                if tool_results:
+                    anthropic_messages.append(
+                        {
+                            "role": "user",
+                            "content": tool_results,  # Array of tool_result blocks
+                        }
+                    )
+                elif skipped_count > 0:
+                    logger.warning(
+                        f"All {skipped_count} consecutive tool_results were orphaned and skipped"
+                    )
+                continue  # i already advanced in while loop
+            if role == "assistant":
+                # Assistant messages - check for tool calls or thinking blocks
+                if "tool_calls" in msg and msg["tool_calls"]:
+                    # Assistant message with tool calls
+                    content_blocks = []
+
+                    # CRITICAL: Check for thinking block and add it FIRST
+                    has_thinking = "thinking_block" in msg and msg["thinking_block"]
+                    if has_thinking:
+                        # Clean thinking block (remove visibility field not accepted by API)
+                        cleaned_thinking = self._clean_content_block(
+                            msg["thinking_block"]
+                        )
+                        content_blocks.append(cleaned_thinking)
+
+                    # Add text content if present, BUT skip when we have thinking + tool_calls
+                    # When all three are present (thinking + text + tool_use), the text was generated
+                    # but not shown to user yet (tool calls execute first). Including it in history
+                    # misleads the model into thinking it already communicated that info.
+                    if content and not has_thinking:
+                        if isinstance(content, list):
+                            # Content is a list of blocks - extract text blocks only
+                            for block in content:
+                                if (
+                                    isinstance(block, dict)
+                                    and block.get("type") == "text"
+                                ):
+                                    content_blocks.append(
+                                        {"type": "text", "text": block.get("text", "")}
+                                    )
+                                elif (
+                                    not isinstance(block, dict)
+                                    and hasattr(block, "type")
+                                    and block.type == "text"
+                                ):
+                                    content_blocks.append(
+                                        {
+                                            "type": "text",
+                                            "text": getattr(block, "text", ""),
+                                        }
+                                    )
+                        else:
+                            # Content is a simple string
+                            content_blocks.append({"type": "text", "text": content})
+
+                    # Add tool_use blocks
+                    for tc in msg["tool_calls"]:
+                        content_blocks.append(
+                            {
+                                "type": "tool_use",
+                                "id": tc.get("id", ""),
+                                "name": tc.get("tool", ""),
+                                "input": tc.get("arguments", {}),
+                            }
+                        )
+
+                    anthropic_messages.append(
+                        {"role": "assistant", "content": content_blocks}
+                    )
+                elif "thinking_block" in msg and msg["thinking_block"]:
+                    # Assistant message with thinking block
+                    # Clean thinking block (remove visibility field not accepted by API)
+                    cleaned_thinking = self._clean_content_block(msg["thinking_block"])
+                    content_blocks = [cleaned_thinking]
+                    if content:
+                        if isinstance(content, list):
+                            # Content is a list of blocks - extract text blocks only
+                            for block in content:
+                                if (
+                                    isinstance(block, dict)
+                                    and block.get("type") == "text"
+                                ):
+                                    content_blocks.append(
+                                        {"type": "text", "text": block.get("text", "")}
+                                    )
+                                elif (
+                                    not isinstance(block, dict)
+                                    and hasattr(block, "type")
+                                    and block.type == "text"
+                                ):
+                                    content_blocks.append(
+                                        {
+                                            "type": "text",
+                                            "text": getattr(block, "text", ""),
+                                        }
+                                    )
+                        else:
+                            # Content is a simple string
+                            content_blocks.append({"type": "text", "text": content})
+                    anthropic_messages.append(
+                        {"role": "assistant", "content": content_blocks}
+                    )
                 else:
-                    conversation_parts.append(f"<user>{content}</user>")
-
-            elif role == "assistant":
-                assistant_content = self._format_assistant_message(msg)
-                conversation_parts.append(f"<assistant>{assistant_content}</assistant>")
-
-            elif role == "tool":
-                tool_result = self._format_tool_result(msg)
-                conversation_parts.append(f"{tool_result}")
-
+                    # Regular assistant message - may have structured content blocks
+                    if isinstance(content, list):
+                        # Content is a list of blocks - clean each block
+                        cleaned_blocks = [
+                            self._clean_content_block(block) for block in content
+                        ]
+                        anthropic_messages.append(
+                            {"role": "assistant", "content": cleaned_blocks}
+                        )
+                    else:
+                        # Content is a simple string
+                        anthropic_messages.append(
+                            {"role": "assistant", "content": content}
+                        )
+                i += 1
             elif role == "developer":
+                # Developer messages -> XML-wrapped user messages (context files)
                 wrapped = f"<context_file>\n{content}\n</context_file>"
-                conversation_parts.append(f"{wrapped}")
+                anthropic_messages.append({"role": "user", "content": wrapped})
+                i += 1
+            else:
+                # User messages - handle structured content (text + images)
+                if isinstance(content, list):
+                    content_blocks = []
+                    for block in content:
+                        if isinstance(block, dict):
+                            block_type = block.get("type")
+                            if block_type == "text":
+                                content_blocks.append(
+                                    {"type": "text", "text": block.get("text", "")}
+                                )
+                            elif block_type == "image":
+                                # Convert ImageBlock to Anthropic image format
+                                source = block.get("source", {})
+                                if source.get("type") == "base64":
+                                    content_blocks.append(
+                                        {
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": source.get(
+                                                    "media_type", "image/jpeg"
+                                                ),
+                                                "data": source.get("data"),
+                                            },
+                                        }
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"Unsupported image source type: {source.get('type')}"
+                                    )
 
-        if tool_schema:
-            system_parts.append(tool_schema)
-        system_prompt = "\n\n".join(system_parts) if system_parts else ""
-        user_prompt = "\n\n".join(conversation_parts) if conversation_parts else ""
+                    if content_blocks:
+                        anthropic_messages.append(
+                            {"role": "user", "content": content_blocks}
+                        )
+                else:
+                    # Simple string content
+                    anthropic_messages.append({"role": "user", "content": content})
+                i += 1
 
-        if len(messages) == 1 and messages[0].role == "user":
-            user_prompt = self._extract_content(messages[0])
+        return anthropic_messages
 
-        return system_prompt, user_prompt
+    def _convert_tools_from_request(self, tools: list) -> list[dict[str, Any]]:
+        """Convert ToolSpec objects from ChatRequest to Anthropic format.
 
-    def _get_current_turn_messages(self, messages: list[Message]) -> list[Message]:
-        last_assistant_idx = -1
+        Handles both standard function tools (converted to Anthropic format) and
+        model-native tools like web_search_20250305 (passed through unchanged).
 
-        for i, msg in enumerate(messages):
-            if msg.role == "assistant":
-                last_assistant_idx = i
+        Model-native tools are identified by having a 'type' attribute that is NOT
+        'function'. These tools use Anthropic's built-in capabilities and should
+        NOT be converted to the standard function tool format.
 
-        if last_assistant_idx == -1:
+        Args:
+            tools: List of ToolSpec objects or native tool definitions
+
+        Returns:
+            List of Anthropic-formatted tool definitions
+        """
+        anthropic_tools = []
+        for tool in tools:
+            # Check if this is a model-native tool (has 'type' that's not 'function')
+            # Native tools like web_search_20250305 are passed through unchanged
+            tool_type = getattr(tool, "type", None)
+            if tool_type and tool_type != "function":
+                # Model-native tool - pass through as-is (converted to dict if needed)
+                if hasattr(tool, "model_dump"):
+                    anthropic_tools.append(tool.model_dump(exclude_none=True))
+                elif isinstance(tool, dict):
+                    anthropic_tools.append(tool)
+                else:
+                    # Fallback: build dict from known attributes
+                    native_tool: dict[str, Any] = {"type": tool_type}
+                    if hasattr(tool, "name") and tool.name:
+                        native_tool["name"] = tool.name
+                    # Add any additional config (e.g., max_uses for web search)
+                    if hasattr(tool, "max_uses") and tool.max_uses is not None:
+                        native_tool["max_uses"] = tool.max_uses
+                    if (
+                        hasattr(tool, "user_location")
+                        and tool.user_location is not None
+                    ):
+                        native_tool["user_location"] = tool.user_location
+                    anthropic_tools.append(native_tool)
+                logger.debug(f"[PROVIDER] Added native tool: {tool_type}")
+            else:
+                # Standard function tool - convert to Anthropic format
+                anthropic_tools.append(
+                    {
+                        "name": tool.name,
+                        "description": tool.description or "",
+                        "input_schema": tool.parameters,
+                    }
+                )
+        return anthropic_tools
+
+    def _extract_web_search_citations(self, block: Any) -> list[dict[str, Any]]:
+        """Extract citation information from a web search result block.
+
+        Web search results contain citations with source information that can be
+        displayed to users for transparency and attribution.
+
+        Args:
+            block: Web search tool result block from Anthropic response
+
+        Returns:
+            List of citation dicts with title, url, and optional snippet
+        """
+        citations = []
+
+        # Web search results have a 'content' field with search results
+        content = getattr(block, "content", None)
+        if not content:
+            return citations
+
+        # Content may be a list of result items or a single object
+        results = content if isinstance(content, list) else [content]
+
+        for result in results:
+            # Each result may have source information
+            if hasattr(result, "type") and result.type == "web_search_result":
+                citation: dict[str, Any] = {}
+
+                # Extract URL (required)
+                if hasattr(result, "url") and result.url:
+                    citation["url"] = result.url
+                elif hasattr(result, "source_url") and result.source_url:
+                    citation["url"] = result.source_url
+
+                # Extract title
+                if hasattr(result, "title") and result.title:
+                    citation["title"] = result.title
+
+                # Extract snippet/description
+                if hasattr(result, "snippet") and result.snippet:
+                    citation["snippet"] = result.snippet
+                elif hasattr(result, "description") and result.description:
+                    citation["snippet"] = result.description
+                elif hasattr(result, "encrypted_content") and result.encrypted_content:
+                    # Some results use encrypted_content - just note it exists
+                    citation["has_content"] = True
+
+                # Only add if we have at least a URL
+                if citation.get("url"):
+                    citations.append(citation)
+
+        return citations
+
+    def _build_web_search_tool(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Build the native web search tool definition.
+
+        The web_search_20250305 tool is a model-native tool that enables Claude
+        to search the web for current information. Unlike function tools, it uses
+        Anthropic's built-in web search capability.
+
+        Tool definition format:
+            {
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 5,  # optional, limits searches per request
+                "user_location": {...}  # optional, for location-aware results
+            }
+
+        Args:
+            kwargs: Request kwargs that may contain web search configuration
+
+        Returns:
+            Web search tool definition dict
+        """
+        tool: dict[str, Any] = {
+            "type": "web_search_20250305",
+            "name": "web_search",  # Anthropic requires this exact name
+        }
+
+        # Optional: max_uses limits number of searches per request
+        max_uses = kwargs.get("web_search_max_uses") or self.config.get(
+            "web_search_max_uses"
+        )
+        if max_uses is not None:
+            tool["max_uses"] = max_uses
+
+        # Optional: user_location for location-aware search results
+        user_location = kwargs.get("web_search_user_location") or self.config.get(
+            "web_search_user_location"
+        )
+        if user_location is not None:
+            tool["user_location"] = user_location
+
+        return tool
+
+    def _apply_tool_cache_control(
+        self, tools: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Add cache_control to the last tool definition.
+
+        Per Anthropic spec: cache breakpoint on last tool creates
+        checkpoint for entire tool list.
+
+        Args:
+            tools: List of Anthropic-formatted tool definitions
+
+        Returns:
+            Same list with cache_control on last tool (if caching enabled)
+        """
+        if not tools or not self.enable_prompt_caching:
+            return tools
+
+        # Add cache_control to last tool
+        tools[-1]["cache_control"] = {"type": "ephemeral"}
+        return tools
+
+    def _apply_message_cache_control(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Add cache_control to last content block of last message.
+
+        Per Anthropic spec: this creates a checkpoint at the end of
+        conversation history, caching the full context.
+
+        Args:
+            messages: Anthropic-formatted message list
+
+        Returns:
+            Same list with cache_control on last message's last block
+        """
+        if not messages or not self.enable_prompt_caching:
             return messages
 
-        current_turn = messages[last_assistant_idx + 1 :]
-        return current_turn
+        last_msg = messages[-1]
+        content = last_msg.get("content")
 
-    def _extract_content(self, msg: Message) -> str:
-        content = msg.content
-
-        if isinstance(content, str):
-            return content
-
-        if isinstance(content, list):
-            text_parts = []
-            for block in content:
-                if hasattr(block, "text"):
-                    text_parts.append(block.text)
-                elif isinstance(block, dict) and "text" in block:
-                    text_parts.append(block["text"])
-            return "\n".join(text_parts)
-
-        return str(content) if content else ""
-
-    def _format_assistant_message(self, msg: Message) -> str:
-        parts = []
-
-        content = msg.content
-        if isinstance(content, str):
-            parts.append(content)
-        elif isinstance(content, list):
-            for block in content:
-                if hasattr(block, "type"):
-                    if block.type == "text":
-                        parts.append(block.text)
-                    elif block.type in ("tool_use", "tool_call"):
-                        # Format tool call for conversation history
-                        tool_call_str = json.dumps(
-                            {
-                                "tool": block.name,
-                                "id": block.id,
-                                "input": getattr(block, "input", {}),
-                            },
-                            default=str,
-                        )
-                        parts.append(f"<tool_use>{tool_call_str}</tool_use>")
-                elif isinstance(block, dict):
-                    if block.get("type") == "text":
-                        parts.append(block.get("text", ""))
-                    elif block.get("type") in ("tool_use", "tool_call"):
-                        tool_call_str = json.dumps(
-                            {
-                                "tool": block.get("name"),
-                                "id": block.get("id"),
-                                "input": block.get("input", {}),
-                            },
-                            default=str,
-                        )
-                        parts.append(f"<tool_use>{tool_call_str}</tool_use>")
-
-        return "\n".join(parts)
-
-    def _format_tool_result(self, msg: Message) -> str:
-        tool_call_id = getattr(msg, "tool_call_id", None)
-        tool_name = getattr(msg, "name", "unknown")
-        content = self._extract_content(msg)
-        is_error = getattr(msg, "is_error", False)
-
-        result = {
-            "tool_call_id": tool_call_id,
-            "tool": tool_name,
-            "result": content,
-            "is_error": is_error,
-        }
-
-        return f"<tool_result>{json.dumps(result, default=str)}</tool_result>"
-
-    def _convert_tools(self, tools: list[Any]) -> list[dict[str, Any]]:
-        tool_definitions = []
-
-        for tool in tools:
-            if hasattr(tool, "name"):
-                tool_def = {
-                    "name": tool.name,
-                    "description": getattr(tool, "description", ""),
-                    "input_schema": getattr(tool, "parameters", {}),
-                }
-            elif isinstance(tool, dict):
-                tool_def = {
-                    "name": tool.get("name", ""),
-                    "description": tool.get("description", ""),
-                    "input_schema": tool.get(
-                        "parameters", tool.get("input_schema", {})
-                    ),
-                }
-            else:
-                continue
-
-            tool_definitions.append(tool_def)
-
-        return tool_definitions
-
-    def _build_tool_schema(self, tools: list[dict[str, Any]]) -> str:
-        if not tools:
-            return ""
-
-        tools_json = json.dumps(tools, default=str)
-        tool_use_example = json.dumps(
-            {
-                "tool": "tool_name",
-                "id": "unique_id",
-                "input": {"param1": "value1"},
-            }
-        )
-
-        return f"""<system-reminder source="tools-context">
-Available tools:
-<tools>
-{tools_json}
-</tools>
-
-To call a tool, generate a valid JSON with "tool", "id", and "input" fields, wrapped in XML tags in this format:
-<tool_use>
-{tool_use_example}
-</tool_use>
-
-CRITICAL RULES:
-1. Place ALL <tool_use> blocks at the END of your response
-2. After generating <tool_use> blocks, STOP IMMEDIATELY - do not generate any content after them
-3. Do NOT generate hypothetical tool results or continue with analysis before receiving actual results
-4. Do NOT generate JSON arrays with "result_type": "tool_result" - wait for actual <tool_result> blocks
-5. Multiple tool calls are allowed - generate separate <tool_use> blocks for each
-
-Generate a unique ID for each call (e.g., "call_1", "call_2").
-Tool results will be provided in <tool_result> blocks in the next message. Wait for them.
-</system-reminder>"""
-
-    async def _execute_sdk_query(
-        self,
-        prompt: str,
-        model: str,
-        session_id: str | None,
-    ) -> dict[str, Any]:
-        """Execute a query via the Claude Agent SDK using ClaudeSDKClient.
-
-        Uses ClaudeSDKClient for better session management while keeping
-        the XML-based tool protocol for Amplifier orchestrator compatibility.
-        """
-        if session_id:
-            logger.info(f"[PROVIDER] Resuming Claude session: {session_id}")
-
-        sdk_options = ClaudeAgentOptions(
-            tools=[],  # Disable built-in tools (Full Control mode)
-            model=model,
-            system_prompt="",  # System prompt is included in user message
-            resume=session_id,
-            max_thinking_tokens=(
-                self.max_thinking_tokens if self.max_thinking_tokens > 0 else None
-            ),
-            include_partial_messages=True,
-        )
-
-        logger.debug("[PROVIDER] Executing Claude CLI via ClaudeSDKClient")
-
-        response_text = ""
-        thinking_text = ""
-        thinking_signature = ""
-        usage_data: dict[str, Any] = {}
-        metadata: dict[str, Any] = {}
-        _text_block_index = 0
-        _thinking_block_index = 0
-
-        try:
-            async with ClaudeSDKClient(options=sdk_options) as client:
-                await client.query(prompt)
-
-                async for msg in client.receive_response():
-                    if isinstance(msg, SDKAssistantMessage):
-                        if msg.error:
-                            error_labels = {
-                                "rate_limit": "Rate limit exceeded",
-                                "authentication_failed": "Authentication failed",
-                                "billing_error": "Billing error",
-                                "invalid_request": "Invalid request",
-                                "server_error": "Server error",
-                            }
-                            raise RuntimeError(
-                                f"Claude Code error: "
-                                f"{error_labels.get(msg.error, msg.error)}"
-                            )
-
-                        for block in msg.content:
-                            if isinstance(block, SDKTextBlock):
-                                if response_text and block.text:
-                                    response_text += "\n" + block.text
-                                else:
-                                    response_text += block.text
-
-                                if block.text:
-                                    if _text_block_index == 0:
-                                        await self._emit_event(
-                                            "content_block:start",
-                                            {
-                                                "provider": self.name,
-                                                "model": model,
-                                                "type": "text",
-                                                "index": _text_block_index,
-                                            },
-                                        )
-                                    await self._emit_event(
-                                        "content_block:delta",
-                                        {
-                                            "provider": self.name,
-                                            "model": model,
-                                            "type": "text",
-                                            "index": _text_block_index,
-                                            "text": block.text,
-                                        },
-                                    )
-                                    _text_block_index += 1
-
-                            elif isinstance(block, SDKThinkingBlock):
-                                thinking_text = block.thinking
-                                thinking_signature = block.signature
-                                logger.debug(
-                                    f"[PROVIDER] Thinking block: {len(thinking_text)} chars"
-                                )
-
-                                if block.thinking:
-                                    if _thinking_block_index == 0:
-                                        await self._emit_event(
-                                            "content_block:start",
-                                            {
-                                                "provider": self.name,
-                                                "model": model,
-                                                "type": "thinking",
-                                                "index": _thinking_block_index,
-                                            },
-                                        )
-                                    await self._emit_event(
-                                        "thinking:delta",
-                                        {
-                                            "provider": self.name,
-                                            "model": model,
-                                            "index": _thinking_block_index,
-                                            "text": block.thinking,
-                                        },
-                                    )
-                                    _thinking_block_index += 1
-
-                    elif isinstance(msg, SDKResultMessage):
-                        if not response_text and msg.result:
-                            response_text = msg.result
-
-                        metadata = {
-                            METADATA_SESSION_ID: msg.session_id,
-                            METADATA_DURATION_MS: msg.duration_ms,
-                            METADATA_COST_USD: msg.total_cost_usd,
-                            "num_turns": msg.num_turns,
-                        }
-                        usage_data = msg.usage or {}
-
-        except SDKCLINotFoundError as e:
-            raise RuntimeError(
-                "Claude Code CLI not found. Install with: "
-                "curl -fsSL https://claude.ai/install.sh | bash"
-            ) from e
-        except SDKProcessError as e:
-            error_msg = e.stderr or ""
-            if error_msg:
-                logger.error(f"[PROVIDER] CLI failed: {error_msg}")
-                raise RuntimeError(
-                    f"Claude Code CLI failed (exit {e.exit_code}): {error_msg}"
-                ) from e
-            else:
-                raise RuntimeError(
-                    f"Claude Code CLI failed (exit {e.exit_code}): "
-                    "Limits may have been exceeded.\n"
-                    "Check usage https://claude.ai/settings/usage "
-                    "and https://platform.claude.com/settings/billing.\n"
-                    "If API billing is being used, this means Amplifier "
-                    "has access to ANTHROPIC_API_KEY."
-                ) from e
-        except ClaudeSDKError as e:
-            raise RuntimeError(f"Claude Code SDK error: {e}") from e
-
-        # Close any open content block streams
-        if _thinking_block_index > 0:
-            await self._emit_event(
-                "thinking:final",
+        # Handle different content formats
+        if isinstance(content, list) and content:
+            # Array of content blocks - mark last block
+            content[-1]["cache_control"] = {"type": "ephemeral"}
+        elif isinstance(content, str):
+            # String content - convert to block array with cache marker
+            last_msg["content"] = [
                 {
-                    "provider": self.name,
-                    "model": model,
-                    "text": thinking_text,
-                },
-            )
-            await self._emit_event(
-                "content_block:end",
-                {
-                    "provider": self.name,
-                    "model": model,
-                    "type": "thinking",
-                    "index": _thinking_block_index - 1,
-                },
-            )
-        if _text_block_index > 0:
-            await self._emit_event(
-                "content_block:end",
-                {
-                    "provider": self.name,
-                    "model": model,
                     "type": "text",
-                    "index": _text_block_index - 1,
-                },
-            )
-
-        # Parse tool calls from response text
-        tool_calls = self._extract_tool_calls(response_text)
-
-        return {
-            "text": response_text,
-            "tool_calls": tool_calls,
-            "usage": usage_data,
-            "metadata": metadata,
-            "thinking": thinking_text,
-            "thinking_signature": thinking_signature,
-        }
-
-    def _extract_tool_calls(self, text: str) -> list[dict[str, Any]]:
-        """Extract tool calls from response text."""
-        tool_calls = []
-        import re
-
-        code_block_ranges = [
-            (m.start(), m.end()) for m in re.finditer(r"```[\s\S]*?```", text)
-        ]
-
-        def is_inside_code_block(pos: int) -> bool:
-            return any(start <= pos < end for start, end in code_block_ranges)
-
-        pattern = r"<tool_use>\s*(.*?)\s*</tool_use>"
-        for match in re.finditer(pattern, text, re.DOTALL):
-            if is_inside_code_block(match.start()):
-                logger.debug("[PROVIDER] Skipping tool_use inside code block")
-                continue
-
-            content = match.group(1)
-            stripped = content.strip()
-            if not stripped.startswith("{"):
-                logger.debug(f"[PROVIDER] Skipping non-JSON: {stripped[:50]}...")
-                continue
-
-            try:
-                tool_data = json.loads(content)
-                tool_call = {
-                    "id": tool_data.get("id", f"call_{uuid.uuid4().hex[:8]}"),
-                    "name": tool_data.get("tool", tool_data.get("name", "")),
-                    "arguments": tool_data.get("input", tool_data.get("arguments", {})),
+                    "text": content,
+                    "cache_control": {"type": "ephemeral"},
                 }
-
-                if (
-                    self._valid_tool_names
-                    and tool_call["name"] not in self._valid_tool_names
-                ):
-                    logger.debug(
-                        f"[PROVIDER] Filtering invalid tool: {tool_call['name']!r}"
-                    )
-                    self._filtered_tool_calls.append(tool_call)
-                    continue
-
-                tool_calls.append(tool_call)
-            except json.JSONDecodeError as e:
-                error_detail = self._format_json_parse_error(content, e)
-                logger.warning(f"[PROVIDER] Failed to parse tool JSON:\n{error_detail}")
-                continue
-
-        return tool_calls
-
-    def _format_json_parse_error(
-        self, content: str, error: json.JSONDecodeError
-    ) -> str:
-        pos = error.pos
-        lineno = error.lineno
-        colno = error.colno
-
-        context_before = 40
-        context_after = 40
-
-        start = max(0, pos - context_before)
-        end = min(len(content), pos + context_after)
-
-        excerpt = content[start:end]
-        pointer_pos = pos - start
-
-        pointer_line = " " * pointer_pos + "^"
-        prefix = "..." if start > 0 else ""
-        suffix = "..." if end < len(content) else ""
-
-        lines = [
-            f"JSON error at line {lineno}, column {colno}: {error.msg}",
-            f"Content ({len(content)} chars total):",
-            f"  {prefix}{excerpt}{suffix}",
-            f"  {' ' * len(prefix)}{pointer_line}",
-        ]
-
-        if len(content) <= 200:
-            lines.append(f"Full content: {content!r}")
-
-        return "\n".join(lines)
-
-    def _clean_response_text(self, text: str) -> str:
-        cleaned = re.sub(r"<tool_use>.*?</tool_use>", "", text, flags=re.DOTALL)
-        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-
-        return cleaned.strip()
-
-    def _build_response(
-        self, response_data: dict[str, Any], duration: float
-    ) -> ClaudeChatResponse:
-        """Build a ClaudeChatResponse from parsed response data."""
-
-        raw_text = response_data.get("text", "")
-        tool_call_dicts = response_data.get("tool_calls", [])
-        usage_data = response_data.get("usage", {})
-        metadata = response_data.get("metadata", {})
-
-        clean_text = self._clean_response_text(raw_text)
-
-        # Build content blocks - ORDER: thinking -> text -> tool_use
-        content_blocks: list[Any] = []
-        event_blocks: list[TextContent | ThinkingContent | ToolCallContent] = []
-
-        thinking_content = response_data.get("thinking", "")
-        thinking_sig = response_data.get("thinking_signature", "")
-        if thinking_content:
-            thinking_block = ThinkingBlock(
-                thinking=thinking_content,
-                signature=thinking_sig,
-                visibility="internal",
-            )
-            logger.debug(f"[PROVIDER] ThinkingBlock: {len(thinking_content)} chars")
-            content_blocks.append(thinking_block)
-            event_blocks.append(ThinkingContent(text=thinking_content))
-
-        if clean_text:
-            content_blocks.append(TextBlock(text=clean_text))
-            event_blocks.append(TextContent(text=clean_text))
-
-        for tc in tool_call_dicts:
-            content_blocks.append(
-                ToolCallBlock(
-                    id=tc["id"],
-                    name=tc["name"],
-                    input=tc["arguments"],
-                )
-            )
-            event_blocks.append(
-                ToolCallContent(
-                    id=tc["id"],
-                    name=tc["name"],
-                    arguments=tc["arguments"],
-                )
-            )
-
-        # Build tool_calls list for orchestrator
-        tool_calls: list[ToolCall] | None = None
-        if tool_call_dicts:
-            tool_calls = [
-                ToolCall(
-                    id=tc["id"],
-                    name=tc["name"],
-                    arguments=tc["arguments"],
-                )
-                for tc in tool_call_dicts
             ]
 
-        input_tokens = usage_data.get("input_tokens", 0)
-        output_tokens = usage_data.get("output_tokens", 0)
-        cache_read = usage_data.get("cache_read_input_tokens", 0)
-        cache_creation = usage_data.get("cache_creation_input_tokens", 0)
-        total_input = input_tokens + cache_read + cache_creation
+        return messages
 
+    def _convert_to_chat_response(self, response: AnthropicMessage) -> ChatResponse:
+        """Convert Anthropic response to ChatResponse format.
+
+        Args:
+            response: Anthropic API response
+
+        Returns:
+            AnthropicChatResponse with content blocks and streaming-compatible fields
+        """
+
+        content_blocks = []
+        tool_calls = []
+        web_search_results: list[dict[str, Any]] = []
+        event_blocks: list[
+            TextContent | ThinkingContent | ToolCallContent | WebSearchContent
+        ] = []
+        text_accumulator: list[str] = []
+
+        for block in response.content:
+            if block.type == "text":
+                content_blocks.append(TextBlock(text=block.text))
+                text_accumulator.append(block.text)
+                event_blocks.append(TextContent(text=block.text))
+            elif block.type == "thinking":
+                content_blocks.append(
+                    ThinkingBlock(
+                        thinking=block.thinking,
+                        signature=getattr(block, "signature", None),
+                        visibility="internal",
+                    )
+                )
+                event_blocks.append(ThinkingContent(text=block.thinking))
+                # NOTE: Do NOT add thinking to text_accumulator - it's internal process, not response content
+            elif block.type == "tool_use":
+                content_blocks.append(
+                    ToolCallBlock(id=block.id, name=block.name, input=block.input)
+                )
+                tool_calls.append(
+                    ToolCall(id=block.id, name=block.name, arguments=block.input)
+                )
+                event_blocks.append(
+                    ToolCallContent(id=block.id, name=block.name, arguments=block.input)
+                )
+            elif block.type == "web_search_tool_result":
+                # Handle native web search results from Anthropic
+                # Extract citations from search results for observability
+                citations = self._extract_web_search_citations(block)
+                web_search_results.append(
+                    {
+                        "type": "web_search_tool_result",
+                        "tool_use_id": getattr(block, "tool_use_id", None),
+                        "citations": citations,
+                    }
+                )
+                # Add to event blocks for UI display
+                event_blocks.append(
+                    WebSearchContent(
+                        query=getattr(block, "query", ""),
+                        citations=citations,
+                    )
+                )
+                logger.debug(
+                    f"[PROVIDER] Web search returned {len(citations)} citations"
+                )
+
+        # Build usage dict with cache metrics if available
         usage_kwargs: dict[str, Any] = {
-            "input_tokens": total_input,
-            "output_tokens": output_tokens,
-            "total_tokens": total_input + output_tokens,
+            "input_tokens": response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+            "total_tokens": response.usage.input_tokens + response.usage.output_tokens,
         }
-        if cache_creation:
-            usage_kwargs["cache_creation_input_tokens"] = cache_creation
-        if cache_read:
-            usage_kwargs["cache_read_input_tokens"] = cache_read
+
+        # Add cache metrics if available (Anthropic includes these when caching is active)
+        if (
+            hasattr(response.usage, "cache_creation_input_tokens")
+            and response.usage.cache_creation_input_tokens
+        ):
+            usage_kwargs["cache_creation_input_tokens"] = (
+                response.usage.cache_creation_input_tokens
+            )
+        if (
+            hasattr(response.usage, "cache_read_input_tokens")
+            and response.usage.cache_read_input_tokens
+        ):
+            usage_kwargs["cache_read_input_tokens"] = (
+                response.usage.cache_read_input_tokens
+            )
 
         usage = Usage(**usage_kwargs)
-        finish_reason = "tool_use" if tool_calls else "end_turn"
 
-        logger.info(
-            f"[PROVIDER] Response: {len(clean_text)} chars, "
-            f"{len(tool_call_dicts)} tool calls, {duration:.2f}s "
-            f"(tokens: {total_input} in, {output_tokens} out)"
-        )
+        combined_text = "\n\n".join(text_accumulator).strip()
 
         return ClaudeChatResponse(
             content=content_blocks,
-            tool_calls=tool_calls,
+            tool_calls=tool_calls if tool_calls else None,
             usage=usage,
-            finish_reason=finish_reason,
-            metadata=metadata,
+            finish_reason=response.stop_reason,
             content_blocks=event_blocks if event_blocks else None,
-            text=clean_text or None,
+            text=combined_text or None,
+            web_search_results=web_search_results if web_search_results else None,
         )
 
-    async def _emit_event(self, event: str, data: dict[str, Any]) -> None:
-        if self.coordinator and hasattr(self.coordinator, "hooks"):
-            await self.coordinator.hooks.emit(event, data)
+    def _get_amplifier_session_id(self) -> str | None:
+        """Get the Amplifier session ID from the coordinator.
+
+        Returns:
+            Session ID string if available, None otherwise.
+        """
+        if not self.coordinator:
+            return None
+
+        if hasattr(self.coordinator, "session"):
+            session = getattr(self.coordinator, "session", None)
+            if session and hasattr(session, "id"):
+                return str(session.id)
+
+        if hasattr(self.coordinator, "config"):
+            config = getattr(self.coordinator, "config", {})
+            if isinstance(config, dict) and "session_id" in config:
+                return str(config["session_id"])
+
+        return None
+
+    def _get_claude_session_id(self) -> str | None:
+        return self._session_state.metadata.claude_session_id
+
+    def _save_session(self) -> None:
+        self._session_manager.save_session(self._session_state)
+        if self.debug:
+            efficiency = self._session_state.get_cache_efficiency()
+            logger.debug(
+                f"[PROVIDER] Session saved: {self._session_state.metadata.session_id}, "
+                f"cache efficiency: {efficiency:.1%}"
+            )
+
+    def _convert_prompt_from_request_params(
+        self, params: dict[str, list[dict[str, str | list[dict[str, Any]]]]]
+    ) -> str:
+        # only on first prompt
+        system: list[str] = []
+        tools: list[str] = []
+
+        # at each turn
+        system_reminders: list[str] = []
+        user_messages: list[str] = []
+        tool_results: list[str] = []
+
+        for message in params.get("system", []):
+            system.append(message["text"])
+
+        for message in params.get("tools", []):
+            tools.append(
+                f"""{{"name": "{message["name"]}", "input_schema": {json.dumps(message["input_schema"])}}}\n<instructions>\n{message["description"]}\n</instructions>"""
+            )
+
+        for message in params.get("messages", []):
+            match message["role"]:
+                case "user":
+                    match message["content"]:
+                        case str():
+                            user_messages.append(f"[user]: {message['content']}")
+
+                        case list():
+                            for block in message["content"]:
+                                match block["type"]:
+                                    case "tool_result":
+                                        tool_json = json.dumps(
+                                            {
+                                                "id": block["tool_use_id"],
+                                                "output": json.loads(block["content"]),
+                                            }
+                                        )
+                                        tool_results.append(f"[tool]: {tool_json}")
+                                    case "text":
+                                        system_reminders.append(f"""{block["text"]}""")
+
+                                    case _:
+                                        raise NotImplementedError(
+                                            f"[PROVIDER] Unknown block type for user message: {block['type']}"
+                                        )
+                        case _:
+                            raise NotImplementedError(
+                                f"[PROVIDER] Unknown content type for user message: {type(message['content'])}"
+                            )
+
+                case "assistant":
+                    match message["content"]:
+                        case list():
+                            for block in message["content"]:
+                                match block["type"]:
+                                    case "thinking" | "tool_use" | "text":
+                                        pass  # assistant blocks not included in prompt
+
+                                    case _:
+                                        raise NotImplementedError(
+                                            f"[PROVIDER] Unknown block type for assistant message: {block['type']}"
+                                        )
+                        case _:
+                            raise NotImplementedError(
+                                f"[PROVIDER] Unknown content type for assistant message: {type(message['content'])}"
+                            )
+                case _:
+                    raise NotImplementedError(
+                        f"[PROVIDER] Unknown message role: {message['role']}"
+                    )
+
+        prompt = ""
+
+        if not self._session_id:
+            prompt += "<system>\n" + "\n".join(system) + "\n</system>\n\n"
+            prompt += "<tools>\n" + "\n".join(tools) + "\n</tools>\n\n"
+
+        latest_results: list[str] = []
+        for tool_result in tool_results:
+            if tool_result not in self._tool_results:
+                self._tool_results.add(tool_result)
+                latest_results.append(tool_result)
+
+        if latest_results:
+            return "\n".join(latest_results)
+
+        if user_messages:
+            latest_user_message = user_messages[-1]
+            prompt += latest_user_message + "\n\n"
+
+        if system_reminders:
+            prompt += "\n".join(system_reminders) + "\n\n"
+            prompt += f"""<system-reminder source="hooks-tools-reminder">\n{TOOL_USE_REMINDER}</system-reminder>"""
+
+        return prompt
+
+    def _parse_tool_calls_from_text(
+        self, text: str
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Parse [tool]: {...} blocks from response text.
+
+        Tool calls are embedded in the response text using the format defined
+        in _convert_prompt_from_request_params:
+            [tool]: {"name": "tool_name", "id": "1234", "input": {...}}
+
+        Uses json.JSONDecoder.raw_decode for robust multi-line JSON parsing.
+
+        Returns:
+            Tuple of (remaining_text_without_tool_blocks, list_of_tool_call_dicts)
+        """
+        tool_calls: list[dict[str, Any]] = []
+        remaining_parts: list[str] = []
+        last_end = 0
+        marker = "[tool]:"
+        decoder = json.JSONDecoder()
+
+        pos = text.find(marker)
+        while pos != -1:
+            remaining_parts.append(text[last_end:pos])
+
+            json_start = pos + len(marker)
+            # Skip whitespace after marker
+            while json_start < len(text) and text[json_start] in " \t":
+                json_start += 1
+
+            try:
+                tool_data, end_idx = decoder.raw_decode(text, json_start)
+                if isinstance(tool_data, dict) and "name" in tool_data:
+                    tool_calls.append(tool_data)
+                    last_end = end_idx
+                else:
+                    remaining_parts.append(marker)
+                    last_end = pos + len(marker)
+            except json.JSONDecodeError:
+                remaining_parts.append(marker)
+                last_end = pos + len(marker)
+
+            pos = text.find(marker, last_end)
+
+        remaining_parts.append(text[last_end:])
+        remaining_text = "".join(remaining_parts).strip()
+        return remaining_text, tool_calls
+
+    async def _parse_response(self, client: ClaudeSDKClient) -> AnthropicMessage:
+        """Parse messages from Claude Agent SDK into an Anthropic Message.
+
+        Collects content from AssistantMessage blocks and parses tool calls
+        from the response text. Tool calls use the [tool]: {...} format
+        defined in _convert_prompt_from_request_params.
+
+        Extracts usage information and session ID from the ResultMessage.
+        """
+        collected_blocks: list[tuple[str, Any]] = []
+        model = ""
+        session_id: str | None = None
+        input_tokens = 0
+        output_tokens = 0
+        cache_read_tokens: int | None = None
+        cache_creation_tokens: int | None = None
+
+        async for message in client.receive_response():
+            match message:
+                case claude_agent_sdk.types.AssistantMessage():
+                    model = message.model or model
+                    for block in message.content:
+                        if isinstance(block, claude_agent_sdk.types.TextBlock):
+                            collected_blocks.append(("text", block.text))
+                        elif isinstance(block, claude_agent_sdk.types.ThinkingBlock):
+                            collected_blocks.append(("thinking", block))
+                        elif isinstance(block, claude_agent_sdk.types.ToolUseBlock):
+                            collected_blocks.append(("tool_use", block))
+
+                case claude_agent_sdk.types.ResultMessage():
+                    session_id = message.session_id
+                    if message.usage:
+                        input_tokens = message.usage.get("input_tokens", 0)
+                        output_tokens = message.usage.get("output_tokens", 0)
+                        cache_read_tokens = message.usage.get("cache_read_input_tokens")
+                        cache_creation_tokens = message.usage.get(
+                            "cache_creation_input_tokens"
+                        )
+                    if message.is_error:
+                        logger.warning(
+                            f"[PROVIDER] SDK response indicates error: {message.result}"
+                        )
+
+                case claude_agent_sdk.types.SystemMessage():
+                    logger.debug(f"[PROVIDER] SDK system message: {message.subtype}")
+
+                case _:
+                    pass
+
+        # Process content blocks - parse tool calls from text
+        anthropic_content: list[
+            AnthropicTextBlock | AnthropicThinkingBlock | AnthropicToolUseBlock
+        ] = []
+        has_tool_use = False
+
+        for block_type, block_data in collected_blocks:
+            if block_type == "text":
+                remaining_text, tool_calls = self._parse_tool_calls_from_text(
+                    block_data
+                )
+                if remaining_text:
+                    anthropic_content.append(
+                        AnthropicTextBlock(type="text", text=remaining_text)
+                    )
+                for tc in tool_calls:
+                    has_tool_use = True
+                    anthropic_content.append(
+                        AnthropicToolUseBlock(
+                            type="tool_use",
+                            id=tc.get("id", ""),
+                            name=tc["name"],
+                            input=tc.get("input", {}),
+                        )
+                    )
+            elif block_type == "thinking":
+                anthropic_content.append(
+                    AnthropicThinkingBlock(
+                        type="thinking",
+                        thinking=block_data.thinking,
+                        signature=block_data.signature,
+                    )
+                )
+            elif block_type == "tool_use":
+                has_tool_use = True
+                anthropic_content.append(
+                    AnthropicToolUseBlock(
+                        type="tool_use",
+                        id=block_data.id,
+                        name=block_data.name,
+                        input=block_data.input,
+                    )
+                )
+
+        # Build usage with cache metrics if available
+        usage_kwargs: dict[str, Any] = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }
+        if cache_read_tokens is not None:
+            usage_kwargs["cache_read_input_tokens"] = cache_read_tokens
+        if cache_creation_tokens is not None:
+            usage_kwargs["cache_creation_input_tokens"] = cache_creation_tokens
+        usage = AnthropicUsage(**usage_kwargs)
+
+        # Update session ID for future requests (enables resume)
+        if session_id:
+            self._session_id = session_id
+            self._session_state.set_claude_session_id(session_id)
+
+        stop_reason = "tool_use" if has_tool_use else "end_turn"
+
+        return AnthropicMessage(
+            id=session_id or "",
+            content=anthropic_content,
+            model=model,
+            role="assistant",
+            type="message",
+            usage=usage,
+            stop_reason=stop_reason,
+        )
+
+
+TOOL_USE_EXAMPLE = json.dumps(
+    {
+        "name": "tool_name",
+        "id": "1234",
+        "input": {"param1": "value1"},
+    }
+)
+
+TOOL_USE_REMINDER = f"""You have access to the all the tools defined with the <tools> XML block.
+To call a tool generate a valid JSON with "name", "id", and "input" fields in a tool block as shown in the example below.
+<example>
+[tool]: {TOOL_USE_EXAMPLE}
+</example>
+<instructions>
+Usage:
+- Tool blocks written ONLY at the end of your response
+- After tool blocks STOP IMMEDIATELY; do not generate any content
+- Results of tool uses are returned in tool in future messages. Wait for them
+- Generate a short unique id for each tool block
+- The "input" field must respect the "input_schema" in the tool definitions
+- To use multiple tools generate separate tool blocks for each tool
+</instructions>
+"""
