@@ -6,10 +6,10 @@ Amplifier's orchestrator handles tool execution - Claude only decides which tool
 
 __all__ = ["mount", "ClaudeProvider"]
 __amplifier_module_type__ = "provider"
-
 import asyncio
 import json
 import logging
+import re
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -1455,38 +1455,35 @@ class ClaudeProvider:
         """Parse [tool]: {...} blocks from response text."""
 
         tool_blocks: list[AnthropicToolUseBlock] = []
-        remaining_parts: list[str] = []
-
-        last_end = 0
-        marker = "[tool]:"
         decoder = json.JSONDecoder()
 
-        pos = text.find(marker)
-        while pos != -1:
-            remaining_parts.append(text[last_end:pos])
+        marker_pattern = re.compile(r"\[tool\]:\s*")
+        cursor = 0
 
-            json_start = pos + len(marker)
-            # Skip whitespace after marker
-            while json_start < len(text) and text[json_start] in " \t":
-                json_start += 1
+        while True:
+            match = marker_pattern.search(text, cursor)
 
+            if not match:
+                break  # No more tools found
+
+            json_start_pos = match.end()
             try:
-                tool_data, end_idx = decoder.raw_decode(text, json_start)
-                if isinstance(tool_data, dict) and "name" in tool_data:
-                    tool_blocks.append(
-                        AnthropicToolUseBlock(type="tool_use", **tool_data)
-                    )
-                    last_end = end_idx
-                else:
-                    remaining_parts.append(marker)
-                    last_end = pos + len(marker)
-            except json.JSONDecodeError:
-                remaining_parts.append(marker)
-                last_end = pos + len(marker)
+                obj, json_end_pos = decoder.raw_decode(text, idx=json_start_pos)
+                tool_blocks.append(obj)
+                cursor = json_start_pos + json_end_pos
 
-            pos = text.find(marker, last_end)
+            except json.JSONDecodeError as e:
+                start_snippet = max(0, e.pos - 20)
+                end_snippet = min(len(text), e.pos + 20)
 
-        remaining_parts.append(text[last_end:])
+                snippet = text[start_snippet:end_snippet]
+                pointer = " " * (e.pos - start_snippet) + "^"
+                context = f"{snippet}\n{pointer}"
+
+                raise ValueError(
+                    f"[PROVIDER] Failed to decode tool block JSON at position {e.pos}:\n{context}"
+                ) from e
+
         return tool_blocks
 
     async def _parse_response(self, client: ClaudeSDKClient) -> ParsedMessage:
