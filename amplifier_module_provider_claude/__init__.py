@@ -13,7 +13,7 @@ import logging
 import shutil
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 import claude_agent_sdk  # type: ignore
 from amplifier_core import (  # type: ignore
@@ -37,7 +37,6 @@ from amplifier_core.message_models import (  # type: ignore
 from amplifier_core.utils import truncate_values
 from anthropic.types import ThinkingBlock as AnthropicThinkingBlock
 from anthropic.types import ToolUseBlock as AnthropicToolUseBlock
-from anthropic.types.message import StopReason
 from anthropic.types.parsed_message import (
     ParsedContentBlock,
     ParsedMessage,
