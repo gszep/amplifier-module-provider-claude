@@ -1429,8 +1429,8 @@ class ClaudeProvider:
         prompt = ""
 
         if not self._session_id:
-            prompt += "<system>\n" + "\n".join(system) + "\n</system>\n\n"
-            prompt += "<tools>\n" + "\n".join(tools) + "\n</tools>\n\n"
+            prompt += "<system>\n" + "\n\n".join(system) + "\n</system>\n\n"
+            prompt += "<tools>\n" + "\n\n".join(tools) + "\n</tools>\n\n"
 
         latest_results: list[str] = []
         for tool_result in tool_results:
