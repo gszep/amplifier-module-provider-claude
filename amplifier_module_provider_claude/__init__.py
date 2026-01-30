@@ -1239,7 +1239,7 @@ class ClaudeProvider:
         text_accumulator: list[str] = []
 
         for block in response.content:
-            if block.type == "text" and block.text != "(no content)":
+            if block.type == "text":
                 content_blocks.append(TextBlock(text=block.text))
                 text_accumulator.append(block.text)
                 event_blocks.append(TextContent(text=block.text))
@@ -1451,9 +1451,7 @@ class ClaudeProvider:
 
         return prompt
 
-    def _parse_tool_blocks_from_text(
-        self, text: str
-    ) -> tuple[ParsedTextBlock, list[AnthropicToolUseBlock]]:
+    def _parse_tool_blocks_from_text(self, text: str) -> list[AnthropicToolUseBlock]:
         """Parse [tool]: {...} blocks from response text."""
 
         tool_blocks: list[AnthropicToolUseBlock] = []
@@ -1489,12 +1487,7 @@ class ClaudeProvider:
             pos = text.find(marker, last_end)
 
         remaining_parts.append(text[last_end:])
-        text_block = ParsedTextBlock(
-            type="text",
-            text="".join(remaining_parts).strip(),
-        )
-
-        return text_block, tool_blocks
+        return tool_blocks
 
     async def _parse_response(self, client: ClaudeSDKClient) -> ParsedMessage:
         """Parse messages from Claude Agent SDK into an Anthropic ParsedMessage."""
@@ -1511,12 +1504,18 @@ class ClaudeProvider:
                     for block in message.content:
                         match block:
                             case claude_agent_sdk.types.TextBlock():
-                                text_block, tool_blocks = (
-                                    self._parse_tool_blocks_from_text(block.text)
+                                tool_blocks = self._parse_tool_blocks_from_text(
+                                    block.text
                                 )
-
-                                content.append(text_block)
-                                content.extend(tool_blocks)
+                                if tool_blocks:
+                                    content.extend(tool_blocks)
+                                elif block.text != "(no content)":
+                                    content.append(
+                                        text_block=ParsedTextBlock(
+                                            type="text",
+                                            text=block.text,
+                                        )
+                                    )
 
                             case claude_agent_sdk.types.ThinkingBlock():
                                 content.append(
@@ -1603,9 +1602,7 @@ To call a tool generate a valid JSON with "name", "id", and "input" fields in a 
 </example>
 <instructions>
 Usage:
-- Tool blocks written ONLY at the end of your response
-- After tool blocks STOP IMMEDIATELY; do not generate any content
-- Results of tool uses are returned in tool in future messages. Wait for them
+- To use tools, the response must ONLY contain tool blocks. No additional text.
 - Generate a 7 character high-entropy id for each tool block
 - The "input" field must respect the "input_schema" in the tool definitions
 - To use multiple tools generate separate tool blocks for each tool
