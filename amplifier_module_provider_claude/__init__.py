@@ -1386,10 +1386,15 @@ class ClaudeProvider:
                             for block in message["content"]:
                                 match block["type"]:
                                     case "tool_result":
+                                        try:
+                                            output = json.loads(block["content"])
+                                        except json.JSONDecodeError:
+                                            output = block["content"]
+
                                         tool_json = json.dumps(
                                             {
                                                 "id": block["tool_use_id"],
-                                                "output": json.loads(block["content"]),
+                                                "output": output,
                                             }
                                         )
                                         tool_results.append(f"[tool]: {tool_json}")
@@ -1469,7 +1474,7 @@ class ClaudeProvider:
             json_start_pos = match.end()
             try:
                 obj, json_end_pos = decoder.raw_decode(text, idx=json_start_pos)
-                tool_blocks.append(obj)
+                tool_blocks.append(AnthropicToolUseBlock(type="tool_use", **obj))
                 cursor = json_start_pos + json_end_pos
 
             except json.JSONDecodeError as e:
