@@ -1511,7 +1511,7 @@ class ClaudeProvider:
                                     content.extend(tool_blocks)
                                 elif block.text != "(no content)":
                                     content.append(
-                                        text_block=ParsedTextBlock(
+                                        ParsedTextBlock(
                                             type="text",
                                             text=block.text,
                                         )
