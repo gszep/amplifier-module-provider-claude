@@ -23,16 +23,7 @@ amplifier module add provider-claude --source git+https://github.com/gszep/ampli
 ```bash
 amplifier init  # select [3] Claude Code
 ```
-
 > **Note**: If `ANTHROPIC_API_KEY` is set in `~/.amplifier/keys.env` API billing will be used.
-
-This provider parses tool calls from model outputs and therefore the `tools-reminder` hook is needed to minimize hallucinations. Prepend the following to your global settings `~/.amplifier/settings.yaml`:
-
-```yaml
-bundle:
-  app:
-  - git+https://github.com/gszep/amplifier-module-hooks-tools-reminder@main
-```
 
 ## Models
 

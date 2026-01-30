@@ -13,7 +13,7 @@ import logging
 import shutil
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 import claude_agent_sdk  # type: ignore
 from amplifier_core import (  # type: ignore
@@ -35,10 +35,14 @@ from amplifier_core.message_models import (  # type: ignore
     Usage,
 )
 from amplifier_core.utils import truncate_values
-from anthropic.types import TextBlock as AnthropicTextBlock
 from anthropic.types import ThinkingBlock as AnthropicThinkingBlock
 from anthropic.types import ToolUseBlock as AnthropicToolUseBlock
-from anthropic.types.message import Message as AnthropicMessage
+from anthropic.types.message import StopReason
+from anthropic.types.parsed_message import (
+    ParsedContentBlock,
+    ParsedMessage,
+    ParsedTextBlock,
+)
 from anthropic.types.usage import Usage as AnthropicUsage
 from claude_agent_sdk import ClaudeSDKClient  # type: ignore
 from claude_agent_sdk.types import ClaudeAgentOptions  # type: ignore
@@ -1217,7 +1221,7 @@ class ClaudeProvider:
 
         return messages
 
-    def _convert_to_chat_response(self, response: AnthropicMessage) -> ChatResponse:
+    def _convert_to_chat_response(self, response: ParsedMessage) -> ChatResponse:
         """Convert Anthropic response to ChatResponse format.
 
         Args:
@@ -1448,22 +1452,14 @@ class ClaudeProvider:
 
         return prompt
 
-    def _parse_tool_calls_from_text(
+    def _parse_tool_blocks_from_text(
         self, text: str
-    ) -> tuple[str, list[dict[str, Any]]]:
-        """Parse [tool]: {...} blocks from response text.
+    ) -> tuple[ParsedTextBlock, list[AnthropicToolUseBlock]]:
+        """Parse [tool]: {...} blocks from response text."""
 
-        Tool calls are embedded in the response text using the format defined
-        in _convert_prompt_from_request_params:
-            [tool]: {"name": "tool_name", "id": "1234", "input": {...}}
-
-        Uses json.JSONDecoder.raw_decode for robust multi-line JSON parsing.
-
-        Returns:
-            Tuple of (remaining_text_without_tool_blocks, list_of_tool_call_dicts)
-        """
-        tool_calls: list[dict[str, Any]] = []
+        tool_blocks: list[AnthropicToolUseBlock] = []
         remaining_parts: list[str] = []
+
         last_end = 0
         marker = "[tool]:"
         decoder = json.JSONDecoder()
@@ -1480,7 +1476,9 @@ class ClaudeProvider:
             try:
                 tool_data, end_idx = decoder.raw_decode(text, json_start)
                 if isinstance(tool_data, dict) and "name" in tool_data:
-                    tool_calls.append(tool_data)
+                    tool_blocks.append(
+                        AnthropicToolUseBlock(type="tool_use", **tool_data)
+                    )
                     last_end = end_idx
                 else:
                     remaining_parts.append(marker)
@@ -1492,123 +1490,97 @@ class ClaudeProvider:
             pos = text.find(marker, last_end)
 
         remaining_parts.append(text[last_end:])
-        remaining_text = "".join(remaining_parts).strip()
-        return remaining_text, tool_calls
+        text_block = ParsedTextBlock(
+            type="text",
+            text="".join(remaining_parts).strip(),
+        )
 
-    async def _parse_response(self, client: ClaudeSDKClient) -> AnthropicMessage:
-        """Parse messages from Claude Agent SDK into an Anthropic Message.
+        return text_block, tool_blocks
 
-        Collects content from AssistantMessage blocks and parses tool calls
-        from the response text. Tool calls use the [tool]: {...} format
-        defined in _convert_prompt_from_request_params.
+    async def _parse_response(self, client: ClaudeSDKClient) -> ParsedMessage:
+        """Parse messages from Claude Agent SDK into an Anthropic ParsedMessage."""
 
-        Extracts usage information and session ID from the ResultMessage.
-        """
-        collected_blocks: list[tuple[str, Any]] = []
-        model = ""
-        session_id: str | None = None
-        input_tokens = 0
-        output_tokens = 0
-        cache_read_tokens: int | None = None
-        cache_creation_tokens: int | None = None
+        model: str = ""
+        session_id: str = ""
+        content: list[ParsedContentBlock] = []
+        usage = AnthropicUsage(input_tokens=0, output_tokens=0)
 
         async for message in client.receive_response():
             match message:
                 case claude_agent_sdk.types.AssistantMessage():
-                    model = message.model or model
+                    model = message.model
                     for block in message.content:
-                        if isinstance(block, claude_agent_sdk.types.TextBlock):
-                            collected_blocks.append(("text", block.text))
-                        elif isinstance(block, claude_agent_sdk.types.ThinkingBlock):
-                            collected_blocks.append(("thinking", block))
-                        elif isinstance(block, claude_agent_sdk.types.ToolUseBlock):
-                            collected_blocks.append(("tool_use", block))
+                        match block:
+                            case claude_agent_sdk.types.TextBlock():
+                                text_block, tool_blocks = (
+                                    self._parse_tool_blocks_from_text(block.text)
+                                )
+
+                                content.append(text_block)
+                                content.extend(tool_blocks)
+
+                            case claude_agent_sdk.types.ThinkingBlock():
+                                content.append(
+                                    AnthropicThinkingBlock(
+                                        type="thinking",
+                                        thinking=block.thinking,
+                                        signature=block.signature,
+                                    )
+                                )
+                            case _:
+                                raise NotImplementedError(
+                                    f"[PROVIDER] AssistantMessage content block type from SDK: {type(block)}"
+                                )
 
                 case claude_agent_sdk.types.ResultMessage():
                     session_id = message.session_id
                     if message.usage:
-                        input_tokens = message.usage.get("input_tokens", 0)
-                        output_tokens = message.usage.get("output_tokens", 0)
-                        cache_read_tokens = message.usage.get("cache_read_input_tokens")
-                        cache_creation_tokens = message.usage.get(
-                            "cache_creation_input_tokens"
+                        usage.input_tokens = message.usage.get(
+                            "input_tokens",
+                            0,
                         )
+                        usage.output_tokens = message.usage.get(
+                            "output_tokens",
+                            0,
+                        )
+                        usage.cache_read_input_tokens = message.usage.get(
+                            "cache_read_input_tokens",
+                            None,
+                        )
+                        usage.cache_creation_input_tokens = message.usage.get(
+                            "cache_creation_input_tokens",
+                            None,
+                        )
+
                     if message.is_error:
                         logger.warning(
                             f"[PROVIDER] SDK response indicates error: {message.result}"
                         )
 
                 case claude_agent_sdk.types.SystemMessage():
-                    logger.debug(f"[PROVIDER] SDK system message: {message.subtype}")
+                    logger.debug(
+                        f"[PROVIDER] SDK {message.subtype} system message:{message.data}"
+                    )
 
                 case _:
-                    pass
-
-        # Process content blocks - parse tool calls from text
-        anthropic_content: list[
-            AnthropicTextBlock | AnthropicThinkingBlock | AnthropicToolUseBlock
-        ] = []
-        has_tool_use = False
-
-        for block_type, block_data in collected_blocks:
-            if block_type == "text":
-                remaining_text, tool_calls = self._parse_tool_calls_from_text(
-                    block_data
-                )
-                if remaining_text:
-                    anthropic_content.append(
-                        AnthropicTextBlock(type="text", text=remaining_text)
+                    raise NotImplementedError(
+                        f"[PROVIDER] Unknown message type from SDK: {type(message)}"
                     )
-                for tc in tool_calls:
-                    has_tool_use = True
-                    anthropic_content.append(
-                        AnthropicToolUseBlock(
-                            type="tool_use",
-                            id=tc.get("id", ""),
-                            name=tc["name"],
-                            input=tc.get("input", {}),
-                        )
-                    )
-            elif block_type == "thinking":
-                anthropic_content.append(
-                    AnthropicThinkingBlock(
-                        type="thinking",
-                        thinking=block_data.thinking,
-                        signature=block_data.signature,
-                    )
-                )
-            elif block_type == "tool_use":
-                has_tool_use = True
-                anthropic_content.append(
-                    AnthropicToolUseBlock(
-                        type="tool_use",
-                        id=block_data.id,
-                        name=block_data.name,
-                        input=block_data.input,
-                    )
-                )
-
-        # Build usage with cache metrics if available
-        usage_kwargs: dict[str, Any] = {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-        }
-        if cache_read_tokens is not None:
-            usage_kwargs["cache_read_input_tokens"] = cache_read_tokens
-        if cache_creation_tokens is not None:
-            usage_kwargs["cache_creation_input_tokens"] = cache_creation_tokens
-        usage = AnthropicUsage(**usage_kwargs)
 
         # Update session ID for future requests (enables resume)
         if session_id:
             self._session_id = session_id
             self._session_state.set_claude_session_id(session_id)
 
-        stop_reason = "tool_use" if has_tool_use else "end_turn"
+        stop_reason = (
+            "tool_use"
+            if any(isinstance(block, AnthropicToolUseBlock) for block in content)
+            else "end_turn"
+        )
 
-        return AnthropicMessage(
-            id=session_id or "",
-            content=anthropic_content,
+        return ParsedMessage(
+            id=session_id,
+            content=content,
             model=model,
             role="assistant",
             type="message",
@@ -1635,7 +1607,7 @@ Usage:
 - Tool blocks written ONLY at the end of your response
 - After tool blocks STOP IMMEDIATELY; do not generate any content
 - Results of tool uses are returned in tool in future messages. Wait for them
-- Generate a short unique id for each tool block
+- Generate a 7 character high-entropy id for each tool block
 - The "input" field must respect the "input_schema" in the tool definitions
 - To use multiple tools generate separate tool blocks for each tool
 </instructions>
