@@ -1239,7 +1239,7 @@ class ClaudeProvider:
         text_accumulator: list[str] = []
 
         for block in response.content:
-            if block.type == "text":
+            if block.type == "text" and block.text != "(no content)":
                 content_blocks.append(TextBlock(text=block.text))
                 text_accumulator.append(block.text)
                 event_blocks.append(TextContent(text=block.text))
