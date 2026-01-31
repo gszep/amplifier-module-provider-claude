@@ -464,7 +464,7 @@ class ClaudeProvider:
         # Enable extended thinking if requested (equivalent to OpenAI's reasoning)
         thinking_enabled = bool(kwargs.get("extended_thinking"))
         thinking_budget = None
-        interleaved_thinking_enabled = False
+        interleaved_thinking_enabled = False  # cli does not support interleaved yet
         if thinking_enabled:
             budget_tokens = (
                 kwargs.get("thinking_budget_tokens")
@@ -490,33 +490,6 @@ class ClaudeProvider:
                 params["max_tokens"] = max(params["max_tokens"], target_tokens)
             else:
                 params["max_tokens"] = target_tokens
-
-            # Auto-enable interleaved thinking when extended thinking is enabled.
-            # Interleaved thinking allows Claude 4 models to think between tool calls,
-            # producing better reasoning on complex multi-step tasks.
-            # Uses the beta header: interleaved-thinking-2025-05-14
-            #
-            # IMPORTANT: We must merge with the instance's configured beta headers
-            # (e.g., context-1m-2025-08-07 for 1M context window). The extra_headers
-            # in params will override the client's default_headers for the same key,
-            # so we need to include ALL beta headers in the combined value.
-            interleaved_thinking_enabled = True
-            combined_beta_headers = list(
-                self._beta_headers
-            )  # Start with configured headers
-            if "interleaved-thinking-2025-05-14" not in combined_beta_headers:
-                combined_beta_headers.append("interleaved-thinking-2025-05-14")
-            params["extra_headers"] = {
-                "anthropic-beta": ",".join(combined_beta_headers)
-            }
-
-            logger.info(
-                "[PROVIDER] Extended thinking enabled (budget=%s, buffer=%s, temperature=1.0, max_tokens=%s, interleaved=%s)",
-                thinking_budget,
-                buffer_tokens,
-                params["max_tokens"],
-                interleaved_thinking_enabled,
-            )
 
         # Add stop_sequences if specified
         if stop_sequences := kwargs.get("stop_sequences"):
