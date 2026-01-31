@@ -45,6 +45,7 @@ from anthropic.types.parsed_message import (
 from anthropic.types.usage import Usage as AnthropicUsage
 from claude_agent_sdk import ClaudeSDKClient  # type: ignore
 from claude_agent_sdk.types import ClaudeAgentOptions  # type: ignore
+from pydantic import ValidationError
 
 from .sessions import SessionManager
 
@@ -1444,9 +1445,9 @@ class ClaudeProvider:
                 latest_results.append(tool_result)
 
         if latest_results:
-            return "\n".join(latest_results)
+            prompt += "\n".join(latest_results) + "\n\n"
 
-        if user_messages:
+        if user_messages and not latest_results:
             latest_user_message = user_messages[-1]
             prompt += latest_user_message + "\n\n"
 
@@ -1460,34 +1461,46 @@ class ClaudeProvider:
         """Parse [tool]: {...} blocks from response text."""
 
         tool_blocks: list[AnthropicToolUseBlock] = []
-        decoder = json.JSONDecoder()
+        errors = []
 
-        marker_pattern = re.compile(r"\[tool\]:\s*")
-        cursor = 0
+        # 1. Match Fenced Code (``` ... ```)
+        # 2. Match Inline Code (` ... `) - assumes no newlines inside inline code
+        # 3. Match Tool Start ([tool]:)
+        tokenizer = re.compile(r"(```(?:.|\n)*?```)|(`[^`\n]*`)|(\[tool\]:)", re.DOTALL)
 
-        while True:
-            match = marker_pattern.search(text, cursor)
-
+        pos = 0
+        while pos < len(text):
+            match = tokenizer.search(text, pos)
             if not match:
-                break  # No more tools found
+                break
 
-            json_start_pos = match.end()
-            try:
-                obj, json_end_pos = decoder.raw_decode(text, idx=json_start_pos)
-                tool_blocks.append(AnthropicToolUseBlock(type="tool_use", **obj))
-                cursor = json_start_pos + json_end_pos
+            start, end = match.span()
+            if match.group(1):
+                # Case 1: Found a ``` fenced block.
+                # IGNORE IT. Move past it.
+                pos = end
 
-            except json.JSONDecodeError as e:
-                start_snippet = max(0, e.pos - 20)
-                end_snippet = min(len(text), e.pos + 20)
+            elif match.group(2):
+                # Case 2: Found an inline ` code block.
+                # IGNORE IT. Move past it.
+                pos = end
 
-                snippet = text[start_snippet:end_snippet]
-                pointer = " " * (e.pos - start_snippet) + "^"
-                context = f"{snippet}\n{pointer}"
+            elif match.group(3):
+                # Case 3: Found "[tool]:". This is in "safe" text.
+                json_start = end
 
-                raise ValueError(
-                    f"[PROVIDER] Failed to decode tool block JSON at position {e.pos}:\n{context}"
-                ) from e
+                while json_start < len(text) and text[json_start].isspace():
+                    json_start += 1
+
+                try:
+                    decoder = json.JSONDecoder()
+                    obj, end_offset = decoder.raw_decode(text, idx=json_start)
+
+                    tool_blocks.append(AnthropicToolUseBlock.model_validate(obj))
+                    pos = json_start + end_offset
+
+                except json.JSONDecodeError | ValidationError:
+                    pos = end
 
         return tool_blocks
 
@@ -1589,22 +1602,33 @@ class ClaudeProvider:
         )
 
 
-TOOL_USE_EXAMPLE = json.dumps(
+TOOL_USE_EXAMPLE_1 = json.dumps(
     {
-        "name": "tool_name",
-        "id": "1234",
+        "type": "tool_use",
+        "name": "one_tool",
+        "id": "tl4nfs4",
         "input": {"param1": "value1"},
     }
 )
 
+TOOL_USE_EXAMPLE_2 = json.dumps(
+    {
+        "type": "tool_use",
+        "name": "another_tool",
+        "id": "tl4xcu5",
+        "input": {"param1": "value1", "param2": 42},
+    }
+)
+
 TOOL_USE_REMINDER = f"""You have access to the all the tools defined with the <tools> XML block.
-To call a tool generate a valid JSON with "name", "id", and "input" fields in a tool block as shown in the example below.
+To call a tool, respond with valid JSONs with "name", "id", and "input" fields in tool blocks as shown in the example below.
 <example>
-[tool]: {TOOL_USE_EXAMPLE}
+[tool]: {TOOL_USE_EXAMPLE_1}
+[tool]: {TOOL_USE_EXAMPLE_2}
 </example>
 <instructions>
 Usage:
-- To use tools, the response must ONLY contain tool blocks. No additional text.
+- The response must ONLY contain tool blocks. No additional text.
 - Generate a 7 character high-entropy id for each tool block
 - The "input" field must respect the "input_schema" in the tool definitions
 - To use multiple tools generate separate tool blocks for each tool
