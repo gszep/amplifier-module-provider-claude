@@ -1571,7 +1571,7 @@ class ClaudeProvider:
             for message in request.messages:
                 if message.role == "assistant":
                     for block in message.content:
-                        if block.text.startswith(SESSION_ID):
+                        if block.type == "text" and block.text.startswith(SESSION_ID):
                             self._session.id = block.text
 
 
