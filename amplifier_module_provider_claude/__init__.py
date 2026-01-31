@@ -13,7 +13,7 @@ import re
 import shutil
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import claude_agent_sdk  # type: ignore
 from amplifier_core import (  # type: ignore
@@ -47,9 +47,8 @@ from claude_agent_sdk import ClaudeSDKClient  # type: ignore
 from claude_agent_sdk.types import ClaudeAgentOptions  # type: ignore
 from pydantic import ValidationError
 
-from .sessions import SessionManager
-
 logger = logging.getLogger(__name__)
+SESSION_ID = "[session_id]:"
 
 
 @dataclass
@@ -62,9 +61,29 @@ class WebSearchContent:
     citations: list[dict[str, str]] = field(default_factory=list)
 
 
+class Session(TextBlock):
+    """Content block for storing the session ID."""
+
+    type: Literal["text"] = "text"
+    visibility: Literal["internal"] = "internal"
+    text: str = SESSION_ID
+
+    @property
+    def id(self) -> str | None:
+        return self.text.replace(SESSION_ID, "").strip()
+
+    @id.setter
+    def id(self, value: str | None):
+        value = value.replace(SESSION_ID, "").strip()
+        self.text = f"{SESSION_ID}{value}" if value else SESSION_ID
+
+
 class ClaudeChatResponse(ChatResponse):
     content_blocks: (
-        list[TextContent | ThinkingContent | ToolCallContent | WebSearchContent] | None
+        list[
+            TextContent | ThinkingContent | ToolCallContent | WebSearchContent | Session
+        ]
+        | None
     ) = None
     text: str | None = None
     web_search_results: list[dict[str, Any]] | None = None
@@ -97,7 +116,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 
     async def cleanup():
         try:
-            await asyncio.shield(asyncio.to_thread(provider._save_session))
+            await asyncio.shield(asyncio.sleep(0))  # placeholder for any async cleanup
         except (asyncio.CancelledError, Exception):
             pass
 
@@ -149,21 +168,8 @@ class ClaudeProvider:
         self.enable_web_search: bool = self.config.get("enable_web_search", False)
 
         self._repaired_tool_ids: set[str] = set()
-        self._session_manager = SessionManager(
-            session_dir=self.config.get("session_dir"),
-        )
-
-        amplifier_session_id = self._get_amplifier_session_id()
-        self._session_state = self._session_manager.get_or_create_session(
-            session_id=amplifier_session_id,
-            name=self.config.get("session_name", "amplifier-claude"),
-        )
-
-        self._valid_tool_names: set[str] = set()
-        self._filtered_tool_calls: list[dict[str, Any]] = []
-
         self._tool_results: set[str] = set()
-        self._session_id: str | None = None
+        self._session: Session = Session()
 
     def get_info(self) -> ProviderInfo:
         return ProviderInfo(
@@ -367,11 +373,7 @@ class ClaudeProvider:
             ChatResponse with content blocks
         """
 
-        request_metadata = getattr(request, "metadata", None) or {}
-        self._session_id = request_metadata.get(
-            "claude:session_id", self._get_claude_session_id()
-        )
-
+        self._set_session_from_request(request)
         logger.debug(
             f"Received ChatRequest with {len(request.messages)} messages (debug={self.debug})"
         )
@@ -571,13 +573,13 @@ class ClaudeProvider:
                 options=ClaudeAgentOptions(
                     tools=[],  # disable built-in tools
                     model=self.default_model,
-                    resume=self._session_id,
+                    resume=self._session.id,
                     system_prompt="---",  # system prompt is passed in messages
                     max_thinking_tokens=self.max_thinking_tokens,
                 )
             ) as client:
                 prompt = self._convert_prompt_from_request_params(params)
-                await client.query(prompt)
+                await client.query(prompt, session_id=self._session.id)
                 response = await self._parse_response(client)
 
         # If we get here, request succeeded - continue with response handling
@@ -1235,7 +1237,7 @@ class ClaudeProvider:
         tool_calls = []
         web_search_results: list[dict[str, Any]] = []
         event_blocks: list[
-            TextContent | ThinkingContent | ToolCallContent | WebSearchContent
+            TextContent | ThinkingContent | ToolCallContent | WebSearchContent | Session
         ] = []
         text_accumulator: list[str] = []
 
@@ -1310,8 +1312,8 @@ class ClaudeProvider:
             )
 
         usage = Usage(**usage_kwargs)
-
         combined_text = "\n\n".join(text_accumulator).strip()
+        content_blocks.append(self._session)
 
         return ClaudeChatResponse(
             content=content_blocks,
@@ -1322,39 +1324,6 @@ class ClaudeProvider:
             text=combined_text or None,
             web_search_results=web_search_results if web_search_results else None,
         )
-
-    def _get_amplifier_session_id(self) -> str | None:
-        """Get the Amplifier session ID from the coordinator.
-
-        Returns:
-            Session ID string if available, None otherwise.
-        """
-        if not self.coordinator:
-            return None
-
-        if hasattr(self.coordinator, "session"):
-            session = getattr(self.coordinator, "session", None)
-            if session and hasattr(session, "id"):
-                return str(session.id)
-
-        if hasattr(self.coordinator, "config"):
-            config = getattr(self.coordinator, "config", {})
-            if isinstance(config, dict) and "session_id" in config:
-                return str(config["session_id"])
-
-        return None
-
-    def _get_claude_session_id(self) -> str | None:
-        return self._session_state.metadata.claude_session_id
-
-    def _save_session(self) -> None:
-        self._session_manager.save_session(self._session_state)
-        if self.debug:
-            efficiency = self._session_state.get_cache_efficiency()
-            logger.debug(
-                f"[PROVIDER] Session saved: {self._session_state.metadata.session_id}, "
-                f"cache efficiency: {efficiency:.1%}"
-            )
 
     def _convert_prompt_from_request_params(
         self, params: dict[str, list[dict[str, str | list[dict[str, Any]]]]]
@@ -1434,7 +1403,7 @@ class ClaudeProvider:
 
         prompt = ""
 
-        if not self._session_id:
+        if not self._session.id:
             prompt += "<system>\n" + "\n\n".join(system) + "\n</system>\n\n"
             prompt += "<tools>\n" + "\n\n".join(tools) + "\n</tools>\n\n"
 
@@ -1508,7 +1477,6 @@ class ClaudeProvider:
         """Parse messages from Claude Agent SDK into an Anthropic ParsedMessage."""
 
         model: str = ""
-        session_id: str = ""
         content: list[ParsedContentBlock] = []
         usage = AnthropicUsage(input_tokens=0, output_tokens=0)
 
@@ -1546,7 +1514,9 @@ class ClaudeProvider:
                                 )
 
                 case claude_agent_sdk.types.ResultMessage():
-                    session_id = message.session_id
+                    self._session.id = (
+                        message.session_id
+                    )  # update session - enables resume
                     if message.usage:
                         usage.input_tokens = message.usage.get(
                             "input_tokens",
@@ -1580,11 +1550,6 @@ class ClaudeProvider:
                         f"[PROVIDER] Unknown message type from SDK: {type(message)}"
                     )
 
-        # Update session ID for future requests (enables resume)
-        if session_id:
-            self._session_id = session_id
-            self._session_state.set_claude_session_id(session_id)
-
         stop_reason = (
             "tool_use"
             if any(isinstance(block, AnthropicToolUseBlock) for block in content)
@@ -1592,7 +1557,7 @@ class ClaudeProvider:
         )
 
         return ParsedMessage(
-            id=session_id,
+            id=self._session.id,
             content=content,
             model=model,
             role="assistant",
@@ -1600,6 +1565,14 @@ class ClaudeProvider:
             usage=usage,
             stop_reason=stop_reason,
         )
+
+    def _set_session_from_request(self, request: ChatRequest):
+        if not self._session.id:
+            for message in request.messages:
+                if message.role == "assistant":
+                    for block in message.content:
+                        if block.text.startswith(SESSION_ID):
+                            self._session.id = block.text
 
 
 TOOL_USE_EXAMPLE_1 = json.dumps(
