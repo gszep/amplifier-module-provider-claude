@@ -1496,7 +1496,7 @@ class ClaudeProvider:
                     obj, end_offset = decoder.raw_decode(text, idx=json_start)
 
                     tool_blocks.append(AnthropicToolUseBlock.model_validate(obj))
-                    pos = json_start + end_offset
+                    pos = end_offset
 
                 except json.JSONDecodeError | ValidationError:
                     pos = end
@@ -1607,26 +1607,37 @@ class ClaudeProvider:
                             self._session.data = block.data
 
 
-TOOL_USE_EXAMPLE = json.dumps(
+TOOL_USE_EXAMPLE1 = json.dumps(
     {
         "type": "tool_use",
-        "name": "one_tool",
+        "name": "first_tool",
         "id": "tl4xcu5",
         "input": {"param1": "value1", "param2": 42},
     }
 )
 
+TOOL_USE_EXAMPLE2 = json.dumps(
+    {
+        "type": "tool_use",
+        "name": "second_tool",
+        "id": "tl4t214",
+        "input": {"param1": "valueX"},
+    }
+)
+
 TOOL_USE_REMINDER = f"""You have access to the all the tools defined with the <tools> XML block.
-To call a tool respond with a tool block with a valid JSON with "name", "id", and "input" fields as shown in the example below.
+To call tools respond with tool blocks with a valid JSON with "name", "id", and "input" fields.
+In the example below two tools are being called in parallel.
 <example>
-[tool]: {TOOL_USE_EXAMPLE}
+[tool]: {TOOL_USE_EXAMPLE1}
+[tool]: {TOOL_USE_EXAMPLE2}
 </example>
 <instructions>
 Usage:
-- The response must ONLY contain one tool block. No additional text.
+- The response must ONLY contain tool blocks. No additional text.
 - Generate a 7 character high-entropy id for each tool block
 - The "input" field must respect the "input_schema" in the tool definitions
-- Wait for the next turn to call the next tool
+- Wait for the next turn for the tool results
 </instructions>
 """
 
