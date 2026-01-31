@@ -24,6 +24,7 @@ from amplifier_core import (  # type: ignore
     ThinkingContent,
     ToolCallContent,
 )
+from amplifier_core.content_models import ToolResultContent
 from amplifier_core.message_models import (  # type: ignore
     ChatRequest,
     ChatResponse,
@@ -33,9 +34,13 @@ from amplifier_core.message_models import (  # type: ignore
     ThinkingBlock,
     ToolCall,
     ToolCallBlock,
+    ToolResultBlock,
     Usage,
 )
 from amplifier_core.utils import truncate_values
+from anthropic.types import (
+    RedactedThinkingBlock as AnthropicRedactedThinkingBlock,  # type: ignore
+)
 from anthropic.types import ThinkingBlock as AnthropicThinkingBlock  # type: ignore
 from anthropic.types import ToolUseBlock as AnthropicToolUseBlock  # type: ignore
 from anthropic.types.parsed_message import (  # type: ignore
@@ -106,7 +111,12 @@ class Session(RedactedThinkingBlock):
 class ClaudeChatResponse(ChatResponse):
     content_blocks: (
         list[
-            TextContent | ThinkingContent | ToolCallContent | WebSearchContent | Session
+            TextContent
+            | ThinkingContent
+            | ToolCallContent
+            | WebSearchContent
+            | Session
+            | ToolResultContent
         ]
         | None
     ) = None
@@ -1319,6 +1329,16 @@ class ClaudeProvider:
                 logger.debug(
                     f"[PROVIDER] Web search returned {len(citations)} citations"
                 )
+            elif block.type == "redacted_thinking":
+                print(block.data)
+                content_blocks.append(
+                    ToolResultBlock(
+                        tool_call_id="",
+                        output=block.data,
+                        visibility="user",
+                    )
+                )
+                event_blocks.append(ToolResultContent(error=block.data))
 
         # Build usage dict with cache metrics if available
         usage_kwargs: dict[str, Any] = {
@@ -1457,10 +1477,42 @@ class ClaudeProvider:
 
         return prompt
 
-    def _parse_tool_blocks_from_text(self, text: str) -> list[AnthropicToolUseBlock]:
+    def _format_json_parse_error(
+        self, content: str, error: json.JSONDecodeError
+    ) -> str:
+        lines = []
+
+        # Error message with position
+        lines.append(
+            f"JSON error: {error.msg} (line {error.lineno}, column {error.colno})"
+        )
+
+        # Show excerpt around error position with pointer
+        pos = error.pos if error.pos is not None else 0
+        window = 40
+        start = max(0, pos - window)
+        end = min(len(content), pos + window)
+
+        prefix = "..." if start > 0 else ""
+        suffix = "..." if end < len(content) else ""
+        excerpt = f"{prefix}{content[start:end]}{suffix}"
+        pointer_offset = len(prefix) + (pos - start)
+
+        lines.append(f"  {excerpt}")
+        lines.append(f"  {' ' * pointer_offset}^")
+
+        # Show full content if short, omit if long
+        if len(content) <= 200:
+            lines.append(f"Full content: {content}")
+
+        return "\n".join(lines)
+
+    def _parse_tool_blocks_from_text(
+        self, text: str
+    ) -> list[AnthropicToolUseBlock | AnthropicRedactedThinkingBlock]:
         """Parse [tool]: {...} blocks from response text."""
 
-        tool_blocks: list[AnthropicToolUseBlock] = []
+        tool_blocks: list[AnthropicToolUseBlock | AnthropicRedactedThinkingBlock] = []
 
         # 1. Match Fenced Code (``` ... ```)
         # 2. Match Inline Code (` ... `) - assumes no newlines inside inline code
@@ -1495,10 +1547,32 @@ class ClaudeProvider:
                     decoder = json.JSONDecoder()
                     obj, end_offset = decoder.raw_decode(text, idx=json_start)
 
-                    tool_blocks.append(AnthropicToolUseBlock.model_validate(obj))
+                    try:
+                        tool_blocks.append(AnthropicToolUseBlock.model_validate(obj))
+                    except ValidationError as error:
+                        tool_blocks.append(
+                            AnthropicRedactedThinkingBlock(
+                                type="redacted_thinking",
+                                data=str(error),
+                            )
+                        )
+
                     pos = end_offset
 
-                except json.JSONDecodeError | ValidationError:
+                except json.JSONDecodeError as error:
+                    # Extract raw text and adjust error position to be relative
+                    raw_content = text[json_start : json_start + 500]
+                    relative_pos = max(0, (error.pos or 0) - json_start)
+                    adjusted = json.JSONDecodeError(
+                        error.msg, raw_content, relative_pos
+                    )
+
+                    tool_blocks.append(
+                        AnthropicRedactedThinkingBlock(
+                            type="redacted_thinking",
+                            data=self._format_json_parse_error(raw_content, adjusted),
+                        )
+                    )
                     pos = end
 
         return tool_blocks
@@ -1582,7 +1656,12 @@ class ClaudeProvider:
 
         stop_reason = (
             "tool_use"
-            if any(isinstance(block, AnthropicToolUseBlock) for block in content)
+            if any(
+                isinstance(
+                    block, AnthropicToolUseBlock | AnthropicRedactedThinkingBlock
+                )
+                for block in content
+            )
             else "end_turn"
         )
 
