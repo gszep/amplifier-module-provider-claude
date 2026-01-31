@@ -28,6 +28,7 @@ from amplifier_core.message_models import (  # type: ignore
     ChatRequest,
     ChatResponse,
     Message,
+    RedactedThinkingBlock,
     TextBlock,
     ThinkingBlock,
     ToolCall,
@@ -35,20 +36,21 @@ from amplifier_core.message_models import (  # type: ignore
     Usage,
 )
 from amplifier_core.utils import truncate_values
-from anthropic.types import ThinkingBlock as AnthropicThinkingBlock
-from anthropic.types import ToolUseBlock as AnthropicToolUseBlock
-from anthropic.types.parsed_message import (
+from anthropic.types import ThinkingBlock as AnthropicThinkingBlock  # type: ignore
+from anthropic.types import ToolUseBlock as AnthropicToolUseBlock  # type: ignore
+from anthropic.types.parsed_message import (  # type: ignore
     ParsedContentBlock,
     ParsedMessage,
     ParsedTextBlock,
 )
-from anthropic.types.usage import Usage as AnthropicUsage
+from anthropic.types.usage import Usage as AnthropicUsage  # type: ignore
 from claude_agent_sdk import ClaudeSDKClient  # type: ignore
 from claude_agent_sdk.types import ClaudeAgentOptions  # type: ignore
 from pydantic import ValidationError
 
 logger = logging.getLogger(__name__)
-SESSION_ID = "[session_id]:"
+SESSION_TAG = "[session]:"
+SESSION = SESSION_TAG + """{"id": null, "last_message_idx": 0}"""
 
 
 @dataclass
@@ -61,21 +63,44 @@ class WebSearchContent:
     citations: list[dict[str, str]] = field(default_factory=list)
 
 
-class Session(TextBlock):
+class Session(RedactedThinkingBlock):
     """Content block for storing the session ID."""
 
-    type: Literal["text"] = "text"
+    type: Literal["redacted_thinking"] = "redacted_thinking"
     visibility: Literal["internal"] = "internal"
-    text: str = SESSION_ID
+    data: str = SESSION
+
+    @property
+    def json_string(self) -> str:
+        return self.data.replace(SESSION_TAG, "")
+
+    @json_string.setter
+    def json_string(self, value: str):
+        self.data = f"{SESSION_TAG}{value}"
+
+    @property
+    def json(self) -> dict[str, int | str]:
+        return json.loads(self.json_string)
+
+    @json.setter
+    def json(self, value: dict[str, int | str]):
+        self.json_string = json.dumps(value)
 
     @property
     def id(self) -> str | None:
-        return self.text.replace(SESSION_ID, "").strip()
+        return self.json.get("id", None)
 
     @id.setter
     def id(self, value: str | None):
-        value = value.replace(SESSION_ID, "").strip()
-        self.text = f"{SESSION_ID}{value}" if value else SESSION_ID
+        self.json |= {"id": value}
+
+    @property
+    def last_message_idx(self) -> int:
+        return self.json.get("last_message_idx", 0)
+
+    @last_message_idx.setter
+    def last_message_idx(self, value: int):
+        self.json |= {"last_message_idx": value}
 
 
 class ClaudeChatResponse(ChatResponse):
@@ -168,7 +193,6 @@ class ClaudeProvider:
         self.enable_web_search: bool = self.config.get("enable_web_search", False)
 
         self._repaired_tool_ids: set[str] = set()
-        self._tool_results: set[str] = set()
         self._session: Session = Session()
 
     def get_info(self) -> ProviderInfo:
@@ -214,7 +238,7 @@ class ClaudeProvider:
             ),
             ModelInfo(
                 id="haiku",
-                display_name="Claude  Haiku",
+                display_name="Claude Haiku",
                 context_window=self.context_window,
                 max_output_tokens=self.max_output_tokens,
                 capabilities=["tools", "streaming", "json_mode", "fast"],
@@ -233,6 +257,46 @@ class ClaudeProvider:
         if max_length is None:
             max_length = self.debug_truncate_length
         return truncate_values(obj, max_length)
+
+    def _count_trailing_reminders(self, messages: list[Message]) -> int:
+        """Count trailing system reminder messages from end of list."""
+        count = 0
+        for m in reversed(messages):
+            content = m.content if isinstance(m.content, str) else ""
+            if m.role == "user" and "<system-reminder" in content:
+                count += 1
+            else:
+                break
+        return count
+
+    def _get_recent_messages(self, messages: list[Message]) -> list[Message]:
+        has_system_prefix = bool(messages) and messages[0].role == "system"
+        next_message_idx: int | None = None
+
+        if has_system_prefix:
+            trailing_reminders = self._count_trailing_reminders(messages)
+            next_message_idx = len(messages) - trailing_reminders
+
+            if self._session.id and self._session.last_message_idx > 0:
+                idx = self._session.last_message_idx
+
+                # Find end of system messages at the start
+                system_end = 0
+                for i, m in enumerate(messages):
+                    if m.role == "system":
+                        system_end = i + 1
+                    else:
+                        break
+
+                # Only subset if there are old messages to skip
+                if idx > system_end:
+                    messages = list(messages[:system_end]) + list(messages[idx:])
+
+        # Update session index for next turn's message subsetting
+        if next_message_idx is not None:
+            self._session.last_message_idx = next_message_idx
+
+        return messages
 
     def _find_missing_tool_results(
         self, messages: list[Message]
@@ -374,6 +438,8 @@ class ClaudeProvider:
         """
 
         self._set_session_from_request(request)
+        request.messages = self._get_recent_messages(request.messages)
+
         logger.debug(
             f"Received ChatRequest with {len(request.messages)} messages (debug={self.debug})"
         )
@@ -464,7 +530,7 @@ class ClaudeProvider:
         # Enable extended thinking if requested (equivalent to OpenAI's reasoning)
         thinking_enabled = bool(kwargs.get("extended_thinking"))
         thinking_budget = None
-        interleaved_thinking_enabled = False  # cli does not support interleaved yet
+        interleaved_thinking_enabled = False
         if thinking_enabled:
             budget_tokens = (
                 kwargs.get("thinking_budget_tokens")
@@ -490,6 +556,17 @@ class ClaudeProvider:
                 params["max_tokens"] = max(params["max_tokens"], target_tokens)
             else:
                 params["max_tokens"] = target_tokens
+
+            # iinterleaved thinking not available via cli
+            interleaved_thinking_enabled = False
+
+            logger.info(
+                "[PROVIDER] Extended thinking enabled (budget=%s, buffer=%s, temperature=1.0, max_tokens=%s, interleaved=%s)",
+                thinking_budget,
+                buffer_tokens,
+                params["max_tokens"],
+                interleaved_thinking_enabled,
+            )
 
         # Add stop_sequences if specified
         if stop_sequences := kwargs.get("stop_sequences"):
@@ -539,8 +616,6 @@ class ClaudeProvider:
 
         start_time = time.time()
 
-        rate_limit_info: dict[str, Any] = {}
-
         async with asyncio.timeout(self.timeout):
             async with ClaudeSDKClient(
                 options=ClaudeAgentOptions(
@@ -549,6 +624,7 @@ class ClaudeProvider:
                     resume=self._session.id,
                     system_prompt="---",  # system prompt is passed in messages
                     max_thinking_tokens=self.max_thinking_tokens,
+                    betas=self._beta_headers,
                 )
             ) as client:
                 prompt = self._convert_prompt_from_request_params(params)
@@ -561,20 +637,6 @@ class ClaudeProvider:
 
             logger.info("[PROVIDER] Received response from Anthropic API")
             logger.debug(f"[PROVIDER] Response type: {response.model}")
-
-            # Log rate limit status if available
-            if rate_limit_info:
-                tokens_remaining = rate_limit_info.get("tokens_remaining")
-                tokens_limit = rate_limit_info.get("tokens_limit")
-                if tokens_remaining is not None and tokens_limit is not None:
-                    pct_used = (
-                        ((tokens_limit - tokens_remaining) / tokens_limit) * 100
-                        if tokens_limit > 0
-                        else 0
-                    )
-                    logger.debug(
-                        f"[PROVIDER] Rate limit: {tokens_remaining:,}/{tokens_limit:,} tokens remaining ({pct_used:.1f}% used)"
-                    )
 
             # Emit llm:response event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -601,9 +663,6 @@ class ClaudeProvider:
                     "status": "ok",
                     "duration_ms": elapsed_ms,
                 }
-                # Add rate limit info if available
-                if rate_limit_info:
-                    response_event["rate_limits"] = rate_limit_info
 
                 await self.coordinator.hooks.emit("llm:response", response_event)
 
@@ -1353,13 +1412,18 @@ class ClaudeProvider:
                                 f"[PROVIDER] Unknown content type for user message: {type(message['content'])}"
                             )
 
-                case "assistant":
+                case "assistant":  # assistant blocks not included in prompt
                     match message["content"]:
                         case list():
                             for block in message["content"]:
                                 match block["type"]:
-                                    case "thinking" | "tool_use" | "text":
-                                        pass  # assistant blocks not included in prompt
+                                    case (
+                                        "thinking"
+                                        | "tool_use"
+                                        | "text"
+                                        | "redacted_thinking"
+                                    ):
+                                        pass
 
                                     case _:
                                         raise NotImplementedError(
@@ -1376,22 +1440,16 @@ class ClaudeProvider:
 
         prompt = ""
 
-        if not self._session.id:
+        if not self._session.id:  # only include system/tools on first prompt
             prompt += "<system>\n" + "\n\n".join(system) + "\n</system>\n\n"
             prompt += "<tools>\n" + "\n\n".join(tools) + "\n</tools>\n\n"
 
-        latest_results: list[str] = []
-        for tool_result in tool_results:
-            if tool_result not in self._tool_results:
-                self._tool_results.add(tool_result)
-                latest_results.append(tool_result)
+        if tool_results:
+            prompt += "\n".join(tool_results) + "\n\n"
+            prompt += f"""<system-reminder source="hooks-interleaved-thinking">\n{INTERLEAVED_THINKING_REMINDER}\n</system-reminder>\n\n"""
 
-        if latest_results:
-            prompt += "\n".join(latest_results) + "\n\n"
-
-        if user_messages and not latest_results:
-            latest_user_message = user_messages[-1]
-            prompt += latest_user_message + "\n\n"
+        if user_messages:
+            prompt += "\n".join(user_messages) + "\n\n"
 
         if system_reminders:
             prompt += "\n".join(system_reminders) + "\n\n"
@@ -1403,7 +1461,6 @@ class ClaudeProvider:
         """Parse [tool]: {...} blocks from response text."""
 
         tool_blocks: list[AnthropicToolUseBlock] = []
-        errors = []
 
         # 1. Match Fenced Code (``` ... ```)
         # 2. Match Inline Code (` ... `) - assumes no newlines inside inline code
@@ -1465,7 +1522,7 @@ class ClaudeProvider:
                                 )
                                 if tool_blocks:
                                     content.extend(tool_blocks)
-                                elif block.text != "(no content)":
+                                if block.text != "(no content)":
                                     content.append(
                                         ParsedTextBlock(
                                             type="text",
@@ -1544,39 +1601,38 @@ class ClaudeProvider:
             for message in request.messages:
                 if message.role == "assistant":
                     for block in message.content:
-                        if block.type == "text" and block.text.startswith(SESSION_ID):
-                            self._session.id = block.text
+                        if block.type == "redacted_thinking" and block.data.startswith(
+                            SESSION_TAG
+                        ):
+                            self._session.data = block.data
 
 
-TOOL_USE_EXAMPLE_1 = json.dumps(
+TOOL_USE_EXAMPLE = json.dumps(
     {
         "type": "tool_use",
         "name": "one_tool",
-        "id": "tl4nfs4",
-        "input": {"param1": "value1"},
-    }
-)
-
-TOOL_USE_EXAMPLE_2 = json.dumps(
-    {
-        "type": "tool_use",
-        "name": "another_tool",
         "id": "tl4xcu5",
         "input": {"param1": "value1", "param2": 42},
     }
 )
 
 TOOL_USE_REMINDER = f"""You have access to the all the tools defined with the <tools> XML block.
-To call a tool, respond with valid JSONs with "name", "id", and "input" fields in tool blocks as shown in the example below.
+To call a tool respond with a tool block with a valid JSON with "name", "id", and "input" fields as shown in the example below.
 <example>
-[tool]: {TOOL_USE_EXAMPLE_1}
-[tool]: {TOOL_USE_EXAMPLE_2}
+[tool]: {TOOL_USE_EXAMPLE}
 </example>
 <instructions>
 Usage:
-- The response must ONLY contain tool blocks. No additional text.
+- The response must ONLY contain one tool block. No additional text.
 - Generate a 7 character high-entropy id for each tool block
 - The "input" field must respect the "input_schema" in the tool definitions
-- To use multiple tools generate separate tool blocks for each tool
+- Wait for the next turn to call the next tool
 </instructions>
 """
+
+INTERLEAVED_THINKING_REMINDER = """Before proceeding, briefly reflect on what you just learned from the tool result
+- What does this tell you about the problem?
+- Does it change your approach or next steps?
+- Are there any unexpected findings to consider?
+
+Think through this internally, then continue with your work."""
