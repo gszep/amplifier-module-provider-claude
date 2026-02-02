@@ -188,7 +188,7 @@ class ClaudeProvider:
         self.raw_debug: bool = self.config.get("raw_debug", False)
         self.debug_truncate_length: int = self.config.get("debug_truncate_length", 180)
 
-        self.timeout: float = self.config.get("timeout", 300.0)
+        self.timeout: float = self.config.get("timeout", 900.0)
         self.use_streaming = True  # sdk only supports streaming
         self.enable_web_search: bool = self.config.get("enable_web_search", False)
 
@@ -1570,9 +1570,13 @@ class ClaudeProvider:
                             f"[PROVIDER] SDK response indicates error: {message.result}"
                         )
 
-                case claude_agent_sdk.types.SystemMessage():
+                case (
+                    claude_agent_sdk.types.SystemMessage()
+                    | claude_agent_sdk.types.UserMessage()
+                    | claude_agent_sdk.types.StreamEvent()
+                ):
                     logger.debug(
-                        f"[PROVIDER] SDK {message.subtype} system message:{message.data}"
+                        f"[PROVIDER] SDK message type ignored: {type(message)}"
                     )
 
                 case _:
