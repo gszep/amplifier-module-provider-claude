@@ -1,7 +1,6 @@
 """Tests for tool result repair and infinite loop prevention."""
 
 import asyncio
-from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -9,37 +8,6 @@ from amplifier_core import ModuleCoordinator
 from amplifier_core.message_models import ChatRequest, Message, ToolCallBlock
 
 from amplifier_module_provider_claude import ClaudeProvider
-
-
-class DummyResponse:
-    """Minimal response stub for provider tests."""
-
-    def __init__(self, content=None):
-        self.content = content or []
-        self.usage = SimpleNamespace(input_tokens=0, output_tokens=0)
-        self.stop_reason = "end_turn"
-        self.model = "claude-sonnet-4-5-20250929"
-
-
-class MockStreamManager:
-    """Mock for the streaming context manager returned by client.messages.stream()."""
-
-    def __init__(self, response: DummyResponse):
-        self.response = response
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        return False
-
-    async def get_final_message(self):
-        return self.response
-
-
-def create_stream_mock(response: DummyResponse):
-    """Create a mock for client.messages.stream that returns an async context manager."""
-    return MagicMock(return_value=MockStreamManager(response))
 
 
 class FakeHooks:
@@ -59,7 +27,7 @@ def test_tool_call_sequence_missing_tool_message_is_repaired():
     """Missing tool results should be repaired with synthetic results and emit event."""
     # use_streaming=False so we use messages.create (which we mock) instead of messages.stream
     provider = ClaudeProvider(config={"use_streaming": False})
-    provider.client.messages.create = AsyncMock(return_value=DummyResponse())
+    provider._complete_chat_request = AsyncMock(return_value=MagicMock())
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
 
@@ -77,7 +45,7 @@ def test_tool_call_sequence_missing_tool_message_is_repaired():
     asyncio.run(provider.complete(request))
 
     # Should succeed (not raise validation error)
-    provider.client.messages.create.assert_awaited_once()
+    provider._complete_chat_request.assert_awaited_once()
 
     # Should not emit validation error
     assert all(
@@ -92,7 +60,7 @@ def test_tool_call_sequence_missing_tool_message_is_repaired():
         if e[0] == "provider:tool_sequence_repaired"
     ]
     assert len(repair_events) == 1
-    assert repair_events[0][1]["provider"] == "anthropic"
+    assert repair_events[0][1]["provider"] == "claude"
     assert repair_events[0][1]["repair_count"] == 1
     assert repair_events[0][1]["repairs"][0]["tool_name"] == "do_something"
 
@@ -110,7 +78,7 @@ def test_repaired_tool_ids_are_not_detected_again():
     """
     # use_streaming=False so we use messages.create (which we mock) instead of messages.stream
     provider = ClaudeProvider(config={"use_streaming": False})
-    provider.client.messages.create = AsyncMock(return_value=DummyResponse())
+    provider._complete_chat_request = AsyncMock(return_value=MagicMock())
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
 
@@ -169,7 +137,7 @@ def test_multiple_missing_tool_results_all_tracked():
     """Multiple missing tool results should all be tracked to prevent infinite loops."""
     # use_streaming=False so we use messages.create (which we mock) instead of messages.stream
     provider = ClaudeProvider(config={"use_streaming": False})
-    provider.client.messages.create = AsyncMock(return_value=DummyResponse())
+    provider._complete_chat_request = AsyncMock(return_value=MagicMock())
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
 
@@ -211,7 +179,7 @@ def test_streaming_tool_call_sequence_missing_tool_message_is_repaired():
     """Missing tool results should be repaired with streaming API (default mode)."""
     # Default use_streaming=True, mock the streaming API
     provider = ClaudeProvider()
-    provider.client.messages.stream = create_stream_mock(DummyResponse())
+    provider._complete_chat_request = AsyncMock(return_value=MagicMock())
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
 
@@ -229,7 +197,7 @@ def test_streaming_tool_call_sequence_missing_tool_message_is_repaired():
     asyncio.run(provider.complete(request))
 
     # Should succeed (not raise validation error)
-    provider.client.messages.stream.assert_called_once()
+    provider._complete_chat_request.assert_awaited_once()
 
     # Should not emit validation error
     assert all(
@@ -244,7 +212,7 @@ def test_streaming_tool_call_sequence_missing_tool_message_is_repaired():
         if e[0] == "provider:tool_sequence_repaired"
     ]
     assert len(repair_events) == 1
-    assert repair_events[0][1]["provider"] == "anthropic"
+    assert repair_events[0][1]["provider"] == "claude"
     assert repair_events[0][1]["repair_count"] == 1
     assert repair_events[0][1]["repairs"][0]["tool_name"] == "do_something"
 
@@ -253,7 +221,7 @@ def test_streaming_repaired_tool_ids_are_not_detected_again():
     """Repaired tool IDs should be tracked with streaming API (default mode)."""
     # Default use_streaming=True
     provider = ClaudeProvider()
-    provider.client.messages.stream = create_stream_mock(DummyResponse())
+    provider._complete_chat_request = AsyncMock(return_value=MagicMock())
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
 
@@ -315,7 +283,7 @@ def test_streaming_multiple_missing_tool_results_all_tracked():
     """Multiple missing tool results should all be tracked with streaming API (default mode)."""
     # Default use_streaming=True
     provider = ClaudeProvider()
-    provider.client.messages.stream = create_stream_mock(DummyResponse())
+    provider._complete_chat_request = AsyncMock(return_value=MagicMock())
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
 
