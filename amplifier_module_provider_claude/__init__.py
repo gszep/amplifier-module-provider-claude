@@ -34,6 +34,7 @@ from amplifier_core.message_models import (  # type: ignore
     Usage,
 )
 from amplifier_core.utils import truncate_values
+from anthropic import AsyncAnthropic
 from anthropic.types import ThinkingBlock as AnthropicThinkingBlock  # type: ignore
 from anthropic.types import ToolUseBlock as AnthropicToolUseBlock  # type: ignore
 from anthropic.types.parsed_message import (  # type: ignore
@@ -192,6 +193,14 @@ class ClaudeProvider:
 
         self._repaired_tool_ids: set[str] = set()
         self._session: Session = Session()
+        self._client: AsyncAnthropic | None = None
+
+    @property
+    def client(self) -> AsyncAnthropic:
+        """Dummy property to match other providers' structure."""
+        if self._client is None:
+            self._client = AsyncAnthropic(max_retries=0)
+        return self._client
 
     def get_info(self) -> ProviderInfo:
         return ProviderInfo(
@@ -787,7 +796,7 @@ class ClaudeProvider:
             if "signature" in block:
                 cleaned["signature"] = block["signature"]
             return cleaned
-        if block_type == "tool_use":
+        if block_type == "tool_use" or block_type == "tool_call":
             return {
                 "type": "tool_use",
                 "id": block.get("id", ""),
@@ -1286,7 +1295,7 @@ class ClaudeProvider:
                 )
                 event_blocks.append(ThinkingContent(text=block.thinking))
                 # NOTE: Do NOT add thinking to text_accumulator - it's internal process, not response content
-            elif block.type == "tool_use":
+            elif block.type == "tool_use" or block.type == "tool_call":
                 content_blocks.append(
                     ToolCallBlock(id=block.id, name=block.name, input=block.input)
                 )
@@ -1418,6 +1427,7 @@ class ClaudeProvider:
                                     case (
                                         "thinking"
                                         | "tool_use"
+                                        | "tool_call"
                                         | "text"
                                         | "redacted_thinking"
                                     ):
@@ -1455,10 +1465,17 @@ class ClaudeProvider:
 
         return prompt
 
-    def _parse_tool_blocks_from_text(self, text: str) -> list[AnthropicToolUseBlock]:
-        """Parse [tool]: {...} blocks from response text."""
+    def _parse_tool_blocks_from_text(
+        self, text: str
+    ) -> tuple[list[AnthropicToolUseBlock], str]:
+        """Parse [tool]: {...} blocks from response text.
+
+        Returns:
+            Tuple of (parsed tool blocks, cleaned text with tool blocks stripped).
+        """
 
         tool_blocks: list[AnthropicToolUseBlock] = []
+        spans_to_remove: list[tuple[int, int]] = []
 
         # 1. Match Fenced Code (``` ... ```)
         # 2. Match Inline Code (` ... `) - assumes no newlines inside inline code
@@ -1473,17 +1490,12 @@ class ClaudeProvider:
 
             start, end = match.span()
             if match.group(1):
-                # Case 1: Found a ``` fenced block.
-                # IGNORE IT. Move past it.
                 pos = end
 
             elif match.group(2):
-                # Case 2: Found an inline ` code block.
-                # IGNORE IT. Move past it.
                 pos = end
 
             elif match.group(3):
-                # Case 3: Found "[tool]:". This is in "safe" text.
                 json_start = end
 
                 while json_start < len(text) and text[json_start].isspace():
@@ -1494,12 +1506,28 @@ class ClaudeProvider:
                     obj, end_offset = decoder.raw_decode(text, idx=json_start)
 
                     tool_blocks.append(AnthropicToolUseBlock.model_validate(obj))
+                    spans_to_remove.append((start, end_offset))
                     pos = end_offset
 
-                except json.JSONDecodeError | ValidationError:
+                except (json.JSONDecodeError, ValidationError) as e:
+                    logger.warning(
+                        "[PROVIDER] Failed to parse tool block from text: %s", e
+                    )
                     pos = end
 
-        return tool_blocks
+        # Build cleaned text by removing parsed tool block spans
+        if spans_to_remove:
+            parts: list[str] = []
+            prev_end = 0
+            for rm_start, rm_end in spans_to_remove:
+                parts.append(text[prev_end:rm_start])
+                prev_end = rm_end
+            parts.append(text[prev_end:])
+            cleaned = "".join(parts)
+        else:
+            cleaned = text
+
+        return tool_blocks, cleaned
 
     async def _parse_response(self, client: ClaudeSDKClient) -> ParsedMessage:
         """Parse messages from Claude Agent SDK into an Anthropic ParsedMessage."""
@@ -1515,16 +1543,19 @@ class ClaudeProvider:
                     for block in message.content:
                         match block:
                             case claude_agent_sdk.types.TextBlock():
-                                tool_blocks = self._parse_tool_blocks_from_text(
-                                    block.text
+                                tool_blocks, cleaned_text = (
+                                    self._parse_tool_blocks_from_text(block.text)
                                 )
                                 if tool_blocks:
                                     content.extend(tool_blocks)
-                                if block.text != "(no content)":
+                                if (
+                                    cleaned_text.strip()
+                                    and cleaned_text != "(no content)"
+                                ):
                                     content.append(
                                         ParsedTextBlock(
                                             type="text",
-                                            text=block.text,
+                                            text=cleaned_text,
                                         )
                                     )
 

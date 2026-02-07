@@ -36,8 +36,14 @@ allow-direct-references = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--import-mode=importlib"
+addopts = [
+    "--import-mode=importlib",
+    "-m not long",
+]
 asyncio_mode = "strict"
+markers = [
+    "long: marks tests as long-running",
+]
 
 [dependency-groups]
 dev = [

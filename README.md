@@ -39,7 +39,7 @@ This provider wraps the Claude Code CLI:
 - Tool definitions are injected via system prompt
 - Claude's built-in tools are disabled (`--tools ""`)
 - Amplifier's orchestrator handles all tool execution
-- Responses are parsed for `<tool_use>` blocks
+- Responses are parsed for `[tool]:` blocks
 
 This gives Amplifier full control over the tool ecosystem while using Claude Code.
 
