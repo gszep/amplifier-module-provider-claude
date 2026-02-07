@@ -1,7 +1,5 @@
-"""Claude provider module for Amplifier.
-
-Full Control implementation using Claude Code CLI.
-Amplifier's orchestrator handles tool execution - Claude only decides which tools to call.
+"""Claude Claude Code CLI provider module for Amplifier.
+Amplifier's orchestrator handles tool execution - Claude Code only decides which tools to call.
 """
 
 __all__ = ["mount", "ClaudeProvider"]
@@ -151,7 +149,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 class ClaudeProvider:
     """Claude Code CLI integration for Amplifier.
 
-    Full Control mode: Amplifier's orchestrator handles all tool execution.
+    Amplifier's orchestrator handles all tool execution.
     Claude only decides which tools to call.
     """
 

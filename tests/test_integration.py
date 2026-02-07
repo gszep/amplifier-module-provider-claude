@@ -1,6 +1,6 @@
 """Integration tests for provider-claude module.
 
-Tests the Full Control architecture:
+Tests the architecture:
 - Provider returns tool_calls for Amplifier orchestrator to execute
 - Built-in tools are disabled (--tools "")
 - Tool definitions are injected via system prompt
@@ -62,7 +62,7 @@ def test_provider_basic_completion():
 def test_provider_with_tools():
     """Test that provider returns tool_calls for orchestrator execution.
 
-    In Full Control mode, when Claude decides to use a tool:
+    When Claude decides to use a tool:
     1. Provider returns tool_calls in the response
     2. Amplifier orchestrator executes the tool
     3. Orchestrator calls provider again with tool results

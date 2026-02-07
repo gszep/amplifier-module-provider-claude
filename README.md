@@ -35,7 +35,7 @@ amplifier init  # select [3] Claude Code
 
 ## How It Works
 
-This provider wraps the Claude Code CLI in "Full Control" mode:
+This provider wraps the Claude Code CLI:
 - Tool definitions are injected via system prompt
 - Claude's built-in tools are disabled (`--tools ""`)
 - Amplifier's orchestrator handles all tool execution
