@@ -1467,7 +1467,6 @@ class ClaudeProvider:
 
         if tool_results:
             prompt += "\n".join(tool_results) + "\n\n"
-            prompt += f"""<system-reminder source="hooks-interleaved-thinking">\n{INTERLEAVED_THINKING_REMINDER}\n</system-reminder>\n\n"""
 
         if user_messages:
             prompt += "\n".join(user_messages) + "\n\n"
