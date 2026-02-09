@@ -638,6 +638,17 @@ class ClaudeProvider:
                 await client.query(prompt, session_id=self._session.id)
                 response = await self._parse_response(client)
 
+                # Signal CLI that input is complete and wait for graceful exit
+                # so it can flush the full response to its session file before
+                # the context manager tears down the subprocess with SIGTERM.
+                try:
+                    transport = client._transport
+                    await transport.end_input()
+                    if hasattr(transport, "_process") and transport._process:
+                        await asyncio.wait_for(transport._process.wait(), timeout=5.0)
+                except (asyncio.TimeoutError, Exception):
+                    pass
+
         # If we get here, request succeeded - continue with response handling
         try:
             elapsed_ms = int((time.time() - start_time) * 1000)
@@ -1642,14 +1653,19 @@ class ClaudeProvider:
         )
 
     def _set_session_from_request(self, request: ChatRequest):
-        if not self._session.id:
-            for message in request.messages:
-                if message.role == "assistant":
-                    for block in message.content:
-                        if block.type == "redacted_thinking" and block.data.startswith(
-                            SESSION_TAG
-                        ):
-                            self._session.data = block.data
+        for message in reversed(request.messages):
+            if message.role == "assistant" and isinstance(message.content, list):
+                for block in message.content:
+                    if (
+                        hasattr(block, "type")
+                        and block.type == "redacted_thinking"
+                        and hasattr(block, "data")
+                        and block.data.startswith(SESSION_TAG)
+                    ):
+                        self._session.data = block.data
+                        return
+
+        self._session = Session()
 
 
 TOOL_USE_EXAMPLE1 = json.dumps(
