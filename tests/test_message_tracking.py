@@ -131,11 +131,12 @@ def test_resumed_session_sends_only_new_messages():
     ]
     result = provider._get_recent_messages(messages)
 
-    # Should get: system + only new messages after the anchor
-    assert len(result) == 3  # system + user + reminder
+    # Should get: system + anchor assistant + new messages
+    assert len(result) == 4  # system + assistant(anchor) + user + reminder
     assert result[0].role == "system"
-    assert result[1].content == "Do something"
-    assert "<system-reminder" in result[2].content
+    assert result[1].role == "assistant"  # anchor included for tool_use ID validation
+    assert result[2].content == "Do something"
+    assert "<system-reminder" in result[3].content
 
 
 def test_resumed_session_with_tool_results():
@@ -163,12 +164,13 @@ def test_resumed_session_with_tool_results():
     ]
     result = provider._get_recent_messages(messages)
 
-    # system + 2 tool results + reminder
-    assert len(result) == 4
+    # system + assistant(anchor) + 2 tool results + reminder
+    assert len(result) == 5
     assert result[0].role == "system"
-    assert result[1].content[0].type == "tool_result"
+    assert result[1].role == "assistant"  # anchor included for tool_use ID validation
     assert result[2].content[0].type == "tool_result"
-    assert "<system-reminder" in result[3].content
+    assert result[3].content[0].type == "tool_result"
+    assert "<system-reminder" in result[4].content
 
 
 def test_resumed_session_with_hook_outputs():
@@ -202,10 +204,11 @@ def test_resumed_session_with_hook_outputs():
     ]
     result = provider._get_recent_messages(messages)
 
-    # system + tool_result + hook output + reminder
-    assert len(result) == 4
+    # system + assistant(anchor) + tool_result + hook output + reminder
+    assert len(result) == 5
     assert result[0].role == "system"
-    assert result[2].content == "Python check found issues in app.py: formatting"
+    assert result[1].role == "assistant"  # anchor included
+    assert result[3].content == "Python check found issues in app.py: formatting"
 
 
 def test_multiple_session_blocks_uses_most_recent():
@@ -230,10 +233,11 @@ def test_multiple_session_blocks_uses_most_recent():
     ]
     result = provider._get_recent_messages(messages)
 
-    # system + only messages after the SECOND session block
-    assert len(result) == 3  # system + user + reminder
+    # system + anchor assistant + new messages after it
+    assert len(result) == 4  # system + assistant(anchor) + user + reminder
     assert result[0].role == "system"
-    assert result[1].content == "Continue"
+    assert result[1].role == "assistant"  # second session block = anchor
+    assert result[2].content == "Continue"
 
 
 # =============================================================================
@@ -253,8 +257,9 @@ def test_nothing_new_after_session_block():
     ]
     result = provider._get_recent_messages(messages)
 
-    assert len(result) == 1  # just system
+    assert len(result) == 2  # system + assistant(anchor)
     assert result[0].role == "system"
+    assert result[1].role == "assistant"
 
 
 def test_no_session_block_in_resumed_session_sends_all():
@@ -316,10 +321,11 @@ def test_session_block_with_mixed_content_types():
     ]
     result = provider._get_recent_messages(messages)
 
-    # system + tool_results + reminder + hook output
-    assert len(result) == 4
+    # system + assistant(anchor) + tool_results + reminder + hook output
+    assert len(result) == 5
     assert result[0].role == "system"
-    assert result[1].content[0].type == "tool_result"
+    assert result[1].role == "assistant"  # anchor included
+    assert result[2].content[0].type == "tool_result"
 
 
 def test_python_check_change_between_turns_no_resend():
@@ -355,8 +361,8 @@ def test_python_check_change_between_turns_no_resend():
         ),
     ]
     result_n = provider._get_recent_messages(messages_turn_n)
-    # Should be system + 3 new messages
-    assert len(result_n) == 4
+    # system + assistant(anchor) + 3 new messages
+    assert len(result_n) == 5
 
     # Turn N+1: python_check output CHANGED (code was edited), new messages added
     messages_turn_n1 = [
@@ -389,9 +395,9 @@ def test_python_check_change_between_turns_no_resend():
     result_n1 = provider._get_recent_messages(messages_turn_n1)
 
     # Session-block anchor finds the NEWER "Applied fix" assistant message.
-    # Only sends messages after it: tool_result + reminder.
-    # NOT the full conversation (which would be 7 messages).
-    assert len(result_n1) == 3  # system + tool_result + reminder
+    # Includes anchor + messages after it. NOT the full conversation.
+    assert len(result_n1) == 4  # system + assistant(anchor) + tool_result + reminder
     assert result_n1[0].role == "system"
-    assert result_n1[1].content[0].type == "tool_result"
-    assert result_n1[1].content[0].tool_call_id == "ef02"
+    assert result_n1[1].role == "assistant"  # anchor
+    assert result_n1[2].content[0].type == "tool_result"
+    assert result_n1[2].content[0].tool_call_id == "ef02"

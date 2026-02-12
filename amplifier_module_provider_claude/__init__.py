@@ -378,6 +378,12 @@ class ClaudeProvider:
 
         # On resumed session, find the assistant message with our session block.
         # This marks the CLI's last response — everything after it is new.
+        #
+        # The anchor assistant message is INCLUDED in the slice because
+        # downstream _convert_messages needs its tool_use blocks to populate
+        # valid_tool_use_ids. Without it, every tool result is "orphaned."
+        # The assistant content itself is harmless: _convert_prompt_from_request_params
+        # skips all assistant blocks (case "assistant": pass).
         if self._session.id:
             anchor_idx = None
             for i in range(len(conversation) - 1, -1, -1):
@@ -386,7 +392,7 @@ class ClaudeProvider:
                     break
 
             if anchor_idx is not None:
-                conversation = conversation[anchor_idx + 1 :]
+                conversation = conversation[anchor_idx:]
 
         return list(system_messages) + list(conversation)
 
