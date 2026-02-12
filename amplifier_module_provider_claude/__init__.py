@@ -5,6 +5,7 @@ Amplifier's orchestrator handles tool execution - Claude Code only decides which
 __all__ = ["mount", "ClaudeProvider"]
 __amplifier_module_type__ = "provider"
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -101,6 +102,16 @@ class Session(RedactedThinkingBlock):
     def last_message_idx(self, value: int):
         self.json |= {"last_message_idx": value}
 
+    @property
+    def last_delivered_fingerprint(self) -> str | None:
+        return self.json.get("last_delivered_fingerprint", None)
+
+    @last_delivered_fingerprint.setter
+    def last_delivered_fingerprint(self, value: str | None):
+        data = self.json
+        data["last_delivered_fingerprint"] = value
+        self.json = data
+
 
 class ClaudeChatResponse(ChatResponse):
     content_blocks: (
@@ -192,6 +203,7 @@ class ClaudeProvider:
         self.enable_web_search: bool = self.config.get("enable_web_search", False)
 
         self._repaired_tool_ids: set[str] = set()
+        self._available_tool_names: set[str] = set()
         self._session: Session = Session()
         self._client: AsyncAnthropic | None = None
 
@@ -265,45 +277,126 @@ class ClaudeProvider:
             max_length = self.debug_truncate_length
         return truncate_values(obj, max_length)
 
-    def _count_trailing_reminders(self, messages: list[Message]) -> int:
-        """Count trailing system reminder messages from end of list."""
-        count = 0
-        for m in reversed(messages):
-            content = m.content if isinstance(m.content, str) else ""
-            if m.role == "user" and "<system-reminder" in content:
-                count += 1
-            else:
-                break
-        return count
+    @staticmethod
+    def _fingerprint_message(msg: Message) -> str:
+        """Create a content fingerprint for tracking message delivery to CLI.
+
+        Uses role + content hash. Stable for persistent messages across calls.
+        If a message is modified by compaction, the fingerprint changes,
+        triggering a safe fallback to full conversation delivery.
+        """
+        if isinstance(msg.content, str):
+            content_key = msg.content[:500]
+        elif isinstance(msg.content, list):
+            parts = []
+            for block in msg.content[:10]:
+                if hasattr(block, "model_dump"):
+                    parts.append(
+                        json.dumps(block.model_dump(), sort_keys=True, default=str)[
+                            :200
+                        ]
+                    )
+                elif isinstance(block, dict):
+                    parts.append(json.dumps(block, sort_keys=True, default=str)[:200])
+                else:
+                    parts.append(str(block)[:200])
+            content_key = "|".join(parts)
+        else:
+            content_key = str(msg.content)[:500]
+
+        key = f"{msg.role}:{content_key}"
+        return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+    @staticmethod
+    def _is_ephemeral_message(msg: Message) -> bool:
+        """Heuristic to identify hook-injected ephemeral messages.
+
+        Used to find a stable anchor for message delivery tracking.
+        Checks for <system-reminder markers in both string and list content.
+
+        False negatives are safe: fingerprinting an ephemeral message
+        triggers a safe fallback (full conversation delivery) on the next
+        call when the ephemeral message is gone and the fingerprint can't
+        be found.
+        """
+        if msg.role != "user":
+            return False
+
+        if isinstance(msg.content, str):
+            return "<system-reminder" in msg.content
+
+        if isinstance(msg.content, list):
+            for block in msg.content:
+                text = ""
+                if isinstance(block, dict):
+                    text = block.get("text", "")
+                elif hasattr(block, "text"):
+                    text = getattr(block, "text", "")
+                if isinstance(text, str) and "<system-reminder" in text:
+                    return True
+            if not msg.content:
+                return True
+
+        return False
 
     def _get_recent_messages(self, messages: list[Message]) -> list[Message]:
+        """Subset messages for incremental CLI delivery using content fingerprinting.
+
+        Instead of integer indices (which desynchronize when ephemeral messages
+        are added/removed between calls), we track a content fingerprint of the
+        last persistent message delivered to the CLI. On subsequent calls, we
+        find that message and send everything after it.
+
+        If the fingerprinted message can't be found (due to compaction or
+        ephemeral removal), we fall back to sending all non-system messages.
+        This is the safe direction: duplicate delivery is harmless (the CLI
+        already has them in session history), while missing delivery causes
+        hallucinations.
+        """
         has_system_prefix = bool(messages) and messages[0].role == "system"
-        next_message_idx: int | None = None
+        if not has_system_prefix:
+            return messages
 
-        if has_system_prefix:
-            trailing_reminders = self._count_trailing_reminders(messages)
-            next_message_idx = len(messages) - trailing_reminders
+        # Find end of system messages at the start
+        system_end = 0
+        for i, m in enumerate(messages):
+            if m.role == "system":
+                system_end = i + 1
+            else:
+                break
 
-            if self._session.id and self._session.last_message_idx > 0:
-                idx = self._session.last_message_idx
+        system_messages = messages[:system_end]
+        conversation = messages[system_end:]
 
-                # Find end of system messages at the start
-                system_end = 0
-                for i, m in enumerate(messages):
-                    if m.role == "system":
-                        system_end = i + 1
-                    else:
-                        break
+        # On resumed session with a stored fingerprint, subset to only new messages
+        if self._session.id and self._session.last_delivered_fingerprint:
+            # Scan backward through conversation to find the last delivered message
+            match_idx = None
+            for i in range(len(conversation) - 1, -1, -1):
+                fp = self._fingerprint_message(conversation[i])
+                if fp == self._session.last_delivered_fingerprint:
+                    match_idx = i
+                    break
 
-                # Only subset if there are old messages to skip
-                if idx > system_end:
-                    messages = list(messages[:system_end]) + list(messages[idx:])
+            if match_idx is not None:
+                conversation = conversation[match_idx + 1 :]
+            else:
+                # Fingerprint not found (compaction removed it, or it was
+                # ephemeral and got replaced). Send full conversation.
+                # Safe: CLI handles duplicate messages via session history.
+                logger.warning(
+                    "[PROVIDER] Last delivered message fingerprint not found in "
+                    "conversation. Sending full conversation to CLI (safe fallback)."
+                )
 
-        # Update session index for next turn's message subsetting
-        if next_message_idx is not None:
-            self._session.last_message_idx = next_message_idx
+        # Update fingerprint: anchor on the last non-ephemeral message
+        # so the next call can find it even after ephemeral messages change.
+        for m in reversed(conversation):
+            if not self._is_ephemeral_message(m):
+                self._session.last_delivered_fingerprint = self._fingerprint_message(m)
+                break
 
-        return messages
+        return list(system_messages) + list(conversation)
 
     def _find_missing_tool_results(
         self, messages: list[Message]
@@ -516,6 +609,9 @@ class ClaudeProvider:
             params["system"] = system_blocks
 
         # Add tools if provided
+        self._available_tool_names = (
+            {tool.name for tool in request.tools} if request.tools else set()
+        )
         if request.tools:
             tools = self._convert_tools_from_request(request.tools)
             params["tools"] = self._apply_tool_cache_control(tools)
@@ -1493,8 +1589,13 @@ class ClaudeProvider:
     ) -> tuple[list[AnthropicToolUseBlock], str]:
         """Parse [tool]: {...} blocks from response text.
 
+        Validates parsed tool names against available tools to prevent
+        echoed few-shot examples or hallucinated tool calls from being
+        treated as real tool invocations.
+
         Returns:
-            Tuple of (parsed tool blocks, cleaned text with tool blocks stripped).
+            Tuple of (validated tool blocks, cleaned text with all
+            parsed tool block spans stripped regardless of validation).
         """
 
         tool_blocks: list[AnthropicToolUseBlock] = []
@@ -1538,7 +1639,26 @@ class ClaudeProvider:
                     )
                     pos = end
 
-        # Build cleaned text by removing parsed tool block spans
+        # Validate tool names against available tools.
+        # Reject blocks with unknown names (echoed examples, hallucinations).
+        if self._available_tool_names and tool_blocks:
+            validated = []
+            for block in tool_blocks:
+                if block.name in self._available_tool_names:
+                    validated.append(block)
+                else:
+                    logger.warning(
+                        "[PROVIDER] Filtered tool block with unknown name '%s' "
+                        "(id=%s). Not in %d available tools. "
+                        "Likely an echoed example or hallucination.",
+                        block.name,
+                        block.id,
+                        len(self._available_tool_names),
+                    )
+            tool_blocks = validated
+
+        # Build cleaned text by removing ALL parsed tool block spans
+        # (including filtered ones -- strip echoed examples from text too)
         if spans_to_remove:
             parts: list[str] = []
             prev_end = 0
