@@ -5,7 +5,7 @@ Amplifier's orchestrator handles tool execution - Claude Code only decides which
 __all__ = ["mount", "ClaudeProvider"]
 __amplifier_module_type__ = "provider"
 import asyncio
-import hashlib
+
 import json
 import logging
 import re
@@ -50,7 +50,7 @@ from pydantic import ValidationError
 
 logger = logging.getLogger(__name__)
 SESSION_TAG = "[session]:"
-SESSION = SESSION_TAG + """{"id": null, "last_message_idx": 0}"""
+SESSION = SESSION_TAG + """{"id": null}"""
 
 
 @dataclass
@@ -61,6 +61,24 @@ class WebSearchContent:
     query: str = ""
     results: list[dict[str, Any]] = field(default_factory=list)
     citations: list[dict[str, str]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ModelCapabilities:
+    """Per-model capability matrix -- single source of truth.
+
+    Every model-specific decision in the provider (context window size,
+    thinking mode, output capacity, etc.) should be derived from this
+    dataclass rather than scattered if/else checks.
+    """
+
+    family: str
+    max_output_tokens: int = 64000
+    base_context_window: int = 200000
+    supports_thinking: bool = False
+    supports_adaptive_thinking: bool = False
+    default_thinking_budget: int = 0
+    capability_tags: tuple[str, ...] = ("tools", "streaming", "json_mode")
 
 
 class Session(RedactedThinkingBlock):
@@ -93,24 +111,6 @@ class Session(RedactedThinkingBlock):
     @id.setter
     def id(self, value: str | None):
         self.json |= {"id": value}
-
-    @property
-    def last_message_idx(self) -> int:
-        return self.json.get("last_message_idx", 0)
-
-    @last_message_idx.setter
-    def last_message_idx(self, value: int):
-        self.json |= {"last_message_idx": value}
-
-    @property
-    def last_delivered_fingerprint(self) -> str | None:
-        return self.json.get("last_delivered_fingerprint", None)
-
-    @last_delivered_fingerprint.setter
-    def last_delivered_fingerprint(self, value: str | None):
-        data = self.json
-        data["last_delivered_fingerprint"] = value
-        self.json = data
 
 
 class ClaudeChatResponse(ChatResponse):
@@ -184,14 +184,22 @@ class ClaudeProvider:
 
         self.default_model: str = self.config.get("default_model", "sonnet")
         self.temperature: float = self.config.get("temperature", 1.0)  # thinking
-        self.enable_prompt_caching = True  # always enable prompt caching
+        self.enable_prompt_caching: bool = self.config.get(
+            "enable_prompt_caching", True
+        )
 
         self._beta_headers: list[str] = []
         self.context_window = 200000  # beta-headers: 1m context not available
 
-        self.max_tokens: int = self.config.get("max_tokens", 64000)
-        self.max_output_tokens: int = 64000  # claude models support 64K output
-        self.max_thinking_tokens: int = self.config.get("max_thinking_tokens", 32000)
+        # Derive defaults from the configured default model
+        default_caps = self._get_capabilities(self.default_model)
+        self.max_tokens: int = self.config.get(
+            "max_tokens", default_caps.max_output_tokens
+        )
+        self.max_output_tokens: int = default_caps.max_output_tokens
+        self.max_thinking_tokens: int = self.config.get(
+            "max_thinking_tokens", default_caps.default_thinking_budget
+        )
 
         self.priority: int = self.config.get("priority", 100)
         self.debug: bool = self.config.get("debug", False)
@@ -232,41 +240,23 @@ class ClaudeProvider:
         )
 
     async def list_models(self) -> list[ModelInfo]:
-        return [
-            ModelInfo(
-                id="sonnet",
-                display_name="Claude Sonnet",
-                context_window=self.context_window,
-                max_output_tokens=self.max_output_tokens,
-                capabilities=["tools", "thinking", "streaming", "json_mode"],
-                defaults={
-                    "temperature": self.temperature,
-                    "max_tokens": self.max_tokens,
-                },
-            ),
-            ModelInfo(
-                id="opus",
-                display_name="Claude Opus",
-                context_window=self.context_window,
-                max_output_tokens=self.max_output_tokens,
-                capabilities=["tools", "thinking", "streaming", "json_mode"],
-                defaults={
-                    "temperature": self.temperature,
-                    "max_tokens": self.max_tokens,
-                },
-            ),
-            ModelInfo(
-                id="haiku",
-                display_name="Claude Haiku",
-                context_window=self.context_window,
-                max_output_tokens=self.max_output_tokens,
-                capabilities=["tools", "streaming", "json_mode", "fast"],
-                defaults={
-                    "temperature": self.temperature,
-                    "max_tokens": self.max_tokens,
-                },
-            ),
-        ]
+        result = []
+        for model_id in ("sonnet", "opus", "haiku"):
+            caps = self._get_capabilities(model_id)
+            result.append(
+                ModelInfo(
+                    id=model_id,
+                    display_name=f"Claude {model_id.capitalize()}",
+                    context_window=self.context_window,
+                    max_output_tokens=caps.max_output_tokens,
+                    capabilities=list(caps.capability_tags),
+                    defaults={
+                        "temperature": self.temperature,
+                        "max_tokens": caps.max_output_tokens,
+                    },
+                )
+            )
+        return result
 
     def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
         """Recursively truncate string values in nested structures.
@@ -278,80 +268,98 @@ class ClaudeProvider:
         return truncate_values(obj, max_length)
 
     @staticmethod
-    def _fingerprint_message(msg: Message) -> str:
-        """Create a content fingerprint for tracking message delivery to CLI.
-
-        Uses role + content hash. Stable for persistent messages across calls.
-        If a message is modified by compaction, the fingerprint changes,
-        triggering a safe fallback to full conversation delivery.
-        """
-        if isinstance(msg.content, str):
-            content_key = msg.content[:500]
-        elif isinstance(msg.content, list):
-            parts = []
-            for block in msg.content[:10]:
-                if hasattr(block, "model_dump"):
-                    parts.append(
-                        json.dumps(block.model_dump(), sort_keys=True, default=str)[
-                            :200
-                        ]
-                    )
-                elif isinstance(block, dict):
-                    parts.append(json.dumps(block, sort_keys=True, default=str)[:200])
-                else:
-                    parts.append(str(block)[:200])
-            content_key = "|".join(parts)
-        else:
-            content_key = str(msg.content)[:500]
-
-        key = f"{msg.role}:{content_key}"
-        return hashlib.sha256(key.encode()).hexdigest()[:16]
+    def _detect_family(model_id: str) -> str:
+        """Detect the Claude model family from a model ID string."""
+        model_lower = model_id.lower()
+        for family in ("opus", "sonnet", "haiku"):
+            if family in model_lower:
+                return family
+        return "sonnet"  # Default to sonnet for unknown models
 
     @staticmethod
-    def _is_ephemeral_message(msg: Message) -> bool:
-        """Heuristic to identify hook-injected ephemeral messages.
+    def _detect_version(model_id: str, family: str) -> tuple[int, int]:
+        """Extract (major, minor) version from a model ID.
 
-        Used to find a stable anchor for message delivery tracking.
-        Checks for <system-reminder markers in both string and list content.
-
-        False negatives are safe: fingerprinting an ephemeral message
-        triggers a safe fallback (full conversation delivery) on the next
-        call when the ephemeral message is gone and the fingerprint can't
-        be found.
+        Parses patterns like ``claude-opus-4-6``, ``claude-sonnet-4-5-20250929``.
+        Returns ``(0, 0)`` when the version cannot be determined.
         """
-        if msg.role != "user":
+        pattern = rf"{family}-(\d+)-(\d+)"
+        match = re.search(pattern, model_id.lower())
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        return (0, 0)
+
+    @classmethod
+    def _get_capabilities(cls, model_id: str) -> ModelCapabilities:
+        """Return the capability matrix for *model_id*.
+
+        Version requirements:
+        - Opus 4.6+: adaptive thinking, 128K output
+        - Sonnet 4.5+: extended thinking, 64K output
+        - Haiku: fast inference, no thinking
+
+        Unknown versions assume latest capabilities for forward compat.
+        """
+        family = cls._detect_family(model_id)
+        major, minor = cls._detect_version(model_id, family)
+        version_known = (major, minor) != (0, 0)
+
+        if family == "opus":
+            is_46_plus = not version_known or (major, minor) >= (4, 6)
+            return ModelCapabilities(
+                family="opus",
+                max_output_tokens=128000 if is_46_plus else 64000,
+                supports_thinking=True,
+                supports_adaptive_thinking=is_46_plus,
+                default_thinking_budget=64000 if is_46_plus else 32000,
+                capability_tags=("tools", "thinking", "streaming", "json_mode"),
+            )
+
+        if family == "sonnet":
+            return ModelCapabilities(
+                family="sonnet",
+                supports_thinking=True,
+                supports_adaptive_thinking=False,
+                default_thinking_budget=32000,
+                capability_tags=("tools", "thinking", "streaming", "json_mode"),
+            )
+
+        if family == "haiku":
+            return ModelCapabilities(
+                family="haiku",
+                capability_tags=("tools", "streaming", "json_mode", "fast"),
+            )
+
+        # Unknown family -- conservative defaults
+        return ModelCapabilities(family=family)
+
+    @staticmethod
+    def _has_session_block(msg: Message) -> bool:
+        """Check if a message contains a [session]: redacted_thinking block."""
+        if msg.role != "assistant" or not isinstance(msg.content, list):
             return False
-
-        if isinstance(msg.content, str):
-            return "<system-reminder" in msg.content
-
-        if isinstance(msg.content, list):
-            for block in msg.content:
-                text = ""
-                if isinstance(block, dict):
-                    text = block.get("text", "")
-                elif hasattr(block, "text"):
-                    text = getattr(block, "text", "")
-                if isinstance(text, str) and "<system-reminder" in text:
-                    return True
-            if not msg.content:
+        for block in msg.content:
+            if (
+                hasattr(block, "type")
+                and block.type == "redacted_thinking"
+                and hasattr(block, "data")
+                and isinstance(block.data, str)
+                and block.data.startswith(SESSION_TAG)
+            ):
                 return True
-
         return False
 
     def _get_recent_messages(self, messages: list[Message]) -> list[Message]:
-        """Subset messages for incremental CLI delivery using content fingerprinting.
+        """Subset messages for incremental CLI delivery using session block anchor.
 
-        Instead of integer indices (which desynchronize when ephemeral messages
-        are added/removed between calls), we track a content fingerprint of the
-        last persistent message delivered to the CLI. On subsequent calls, we
-        find that message and send everything after it.
+        The provider appends a [session]: redacted_thinking block to every
+        assistant response. This block marks the CLI's last response point.
+        Everything after it is new content that needs delivery.
 
-        If the fingerprinted message can't be found (due to compaction or
-        ephemeral removal), we fall back to sending all non-system messages.
-        This is the safe direction: duplicate delivery is harmless (the CLI
-        already has them in session history), while missing delivery causes
-        hallucinations.
+        This approach is:
+        - Content-agnostic: immune to hook output changes between turns
+        - Position-independent: no integer indices that can desync
+        - Structurally anchored: the session block is always present and unique
         """
         has_system_prefix = bool(messages) and messages[0].role == "system"
         if not has_system_prefix:
@@ -368,33 +376,17 @@ class ClaudeProvider:
         system_messages = messages[:system_end]
         conversation = messages[system_end:]
 
-        # On resumed session with a stored fingerprint, subset to only new messages
-        if self._session.id and self._session.last_delivered_fingerprint:
-            # Scan backward through conversation to find the last delivered message
-            match_idx = None
+        # On resumed session, find the assistant message with our session block.
+        # This marks the CLI's last response — everything after it is new.
+        if self._session.id:
+            anchor_idx = None
             for i in range(len(conversation) - 1, -1, -1):
-                fp = self._fingerprint_message(conversation[i])
-                if fp == self._session.last_delivered_fingerprint:
-                    match_idx = i
+                if self._has_session_block(conversation[i]):
+                    anchor_idx = i
                     break
 
-            if match_idx is not None:
-                conversation = conversation[match_idx + 1 :]
-            else:
-                # Fingerprint not found (compaction removed it, or it was
-                # ephemeral and got replaced). Send full conversation.
-                # Safe: CLI handles duplicate messages via session history.
-                logger.warning(
-                    "[PROVIDER] Last delivered message fingerprint not found in "
-                    "conversation. Sending full conversation to CLI (safe fallback)."
-                )
-
-        # Update fingerprint: anchor on the last non-ephemeral message
-        # so the next call can find it even after ephemeral messages change.
-        for m in reversed(conversation):
-            if not self._is_ephemeral_message(m):
-                self._session.last_delivered_fingerprint = self._fingerprint_message(m)
-                break
+            if anchor_idx is not None:
+                conversation = conversation[anchor_idx + 1 :]
 
         return list(system_messages) + list(conversation)
 
@@ -630,46 +622,94 @@ class ClaudeProvider:
             params["tools"].insert(0, web_search_tool)
             logger.info("[PROVIDER] Native web search tool enabled")
 
-        # Enable extended thinking if requested (equivalent to OpenAI's reasoning)
+        # Enable extended thinking if requested
+        # Precedence chain:
+        #   1. kwargs["extended_thinking"]  -- explicit per-request override
+        #   2. request.reasoning_effort     -- portable kernel interface
+        #   3. config defaults              -- session-level settings
+        #
+        # kwargs["extended_thinking"]=False can disable thinking even when
+        # reasoning_effort is set (explicit opt-out).
         thinking_enabled = bool(kwargs.get("extended_thinking"))
+
+        # Check request.reasoning_effort when kwargs don't specify
+        reasoning_effort = getattr(request, "reasoning_effort", None)
+        if "extended_thinking" not in kwargs and reasoning_effort is not None:
+            # reasoning_effort implies extended_thinking=True
+            thinking_enabled = True
+
         thinking_budget = None
         interleaved_thinking_enabled = False
         if thinking_enabled:
-            budget_tokens = (
-                kwargs.get("thinking_budget_tokens")
-                or self.config.get("thinking_budget_tokens")
-                or 32000
-            )
-            buffer_tokens = kwargs.get("thinking_budget_buffer") or self.config.get(
-                "thinking_budget_buffer", 4096
-            )
+            # Resolve capabilities for the actual model in this request
+            # (may differ from instance default when callers pass model=...).
+            request_caps = self._get_capabilities(params["model"])
 
-            thinking_budget = budget_tokens
-            params["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": budget_tokens,
-            }
-
-            # CRITICAL: Anthropic requires temperature=1.0 when thinking is enabled
-            params["temperature"] = 1.0
-
-            # Ensure max_tokens accommodates thinking budget + response
-            target_tokens = budget_tokens + buffer_tokens
-            if params.get("max_tokens"):
-                params["max_tokens"] = max(params["max_tokens"], target_tokens)
+            # Guard: skip thinking for models that don't support it (e.g. Haiku).
+            # Without this check we would send budget_tokens=0 which violates
+            # the API's >= 1024 minimum.
+            if not request_caps.supports_thinking:
+                logger.info(
+                    "[PROVIDER] Model %s does not support extended thinking"
+                    " -- ignoring thinking request",
+                    params["model"],
+                )
+                thinking_enabled = False
             else:
-                params["max_tokens"] = target_tokens
+                # reasoning_effort maps to budget_tokens:
+                # | reasoning_effort | budget_tokens                    |
+                # |-----------------|----------------------------------|
+                # | "low"           | 4096 (minimal thinking)          |
+                # | "medium"        | model default                    |
+                # | "high"          | model default                    |
+                # | None            | (existing behavior)              |
+                effort_budget: int | None = None
+                if reasoning_effort == "low":
+                    effort_budget = 4096
+                elif reasoning_effort in ("medium", "high"):
+                    effort_budget = request_caps.default_thinking_budget
 
-            # iinterleaved thinking not available via cli
-            interleaved_thinking_enabled = False
+                # Resolve budget: kwargs > reasoning_effort > config > model default
+                budget_tokens = (
+                    kwargs.get("thinking_budget_tokens")
+                    or effort_budget
+                    or self.config.get("thinking_budget_tokens")
+                    or request_caps.default_thinking_budget
+                )
+                buffer_tokens = kwargs.get("thinking_budget_buffer") or self.config.get(
+                    "thinking_budget_buffer", 4096
+                )
 
-            logger.info(
-                "[PROVIDER] Extended thinking enabled (budget=%s, buffer=%s, temperature=1.0, max_tokens=%s, interleaved=%s)",
-                thinking_budget,
-                buffer_tokens,
-                params["max_tokens"],
-                interleaved_thinking_enabled,
-            )
+                thinking_budget = budget_tokens
+                params["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": budget_tokens,
+                }
+
+                # CRITICAL: Anthropic requires temperature=1.0 when thinking is enabled
+                params["temperature"] = 1.0
+
+                # Ensure max_tokens accommodates thinking budget + response.
+                # Cap to the model's output ceiling so we never exceed API limits.
+                model_ceiling = request_caps.max_output_tokens
+                target_tokens = min(budget_tokens + buffer_tokens, model_ceiling)
+                if params.get("max_tokens"):
+                    params["max_tokens"] = min(
+                        max(params["max_tokens"], target_tokens), model_ceiling
+                    )
+                else:
+                    params["max_tokens"] = target_tokens
+
+                # interleaved thinking not available via CLI
+                interleaved_thinking_enabled = False
+
+                logger.info(
+                    "[PROVIDER] Extended thinking enabled (budget=%s, buffer=%s, temperature=1.0, max_tokens=%s, interleaved=%s)",
+                    thinking_budget,
+                    buffer_tokens,
+                    params["max_tokens"],
+                    interleaved_thinking_enabled,
+                )
 
         # Add stop_sequences if specified
         if stop_sequences := kwargs.get("stop_sequences"):
@@ -1448,27 +1488,23 @@ class ClaudeProvider:
                 )
 
         # Build usage dict with cache metrics if available
+        cache_creation = getattr(response.usage, "cache_creation_input_tokens", None)
+        cache_read = getattr(response.usage, "cache_read_input_tokens", None)
+
         usage_kwargs: dict[str, Any] = {
             "input_tokens": response.usage.input_tokens,
             "output_tokens": response.usage.output_tokens,
             "total_tokens": response.usage.input_tokens + response.usage.output_tokens,
+            # Named kernel fields (Phase 2 standard)
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": cache_creation,
         }
 
-        # Add cache metrics if available (Anthropic includes these when caching is active)
-        if (
-            hasattr(response.usage, "cache_creation_input_tokens")
-            and response.usage.cache_creation_input_tokens
-        ):
-            usage_kwargs["cache_creation_input_tokens"] = (
-                response.usage.cache_creation_input_tokens
-            )
-        if (
-            hasattr(response.usage, "cache_read_input_tokens")
-            and response.usage.cache_read_input_tokens
-        ):
-            usage_kwargs["cache_read_input_tokens"] = (
-                response.usage.cache_read_input_tokens
-            )
+        # Keep provider-native extras for backward compat
+        if cache_creation is not None:
+            usage_kwargs["cache_creation_input_tokens"] = cache_creation
+        if cache_read is not None:
+            usage_kwargs["cache_read_input_tokens"] = cache_read
 
         usage = Usage(**usage_kwargs)
         combined_text = "\n\n".join(text_accumulator).strip()

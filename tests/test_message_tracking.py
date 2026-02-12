@@ -1,12 +1,13 @@
-"""Tests for message identity tracking and incremental CLI delivery.
+"""Tests for session-block-anchored incremental CLI delivery.
 
-Covers the fingerprint-based _get_recent_messages() that replaced the
-fragile integer-index approach, and the _is_ephemeral_message() heuristic.
+Covers _has_session_block() and _get_recent_messages() which use the
+[session]: redacted_thinking block as a structural anchor to determine
+which messages have already been delivered to the CLI.
 """
 
-from amplifier_core.message_models import Message, ToolCallBlock
+from amplifier_core.message_models import Message, ToolCallBlock, ToolResultBlock
 
-from amplifier_module_provider_claude import ClaudeProvider
+from amplifier_module_provider_claude import ClaudeProvider, Session
 
 
 def _make_provider() -> ClaudeProvider:
@@ -14,109 +15,66 @@ def _make_provider() -> ClaudeProvider:
     return provider
 
 
+def _make_session_block(session_id: str = "test-session") -> Session:
+    """Create a Session block as the provider would append to responses."""
+    session = Session()
+    session.id = session_id
+    return session
+
+
+def _assistant_with_session(
+    text: str = "", session_id: str = "test-session"
+) -> Message:
+    """Create an assistant message containing a session block."""
+    blocks: list = []
+    if text:
+        blocks.append({"type": "text", "text": text})
+    blocks.append(_make_session_block(session_id))
+    return Message(role="assistant", content=blocks)
+
+
 # =============================================================================
-# _fingerprint_message
+# _has_session_block
 # =============================================================================
 
 
-def test_fingerprint_stable_for_same_message():
-    """Same message produces the same fingerprint across calls."""
-    msg = Message(role="assistant", content="Hello world")
-    fp1 = ClaudeProvider._fingerprint_message(msg)
-    fp2 = ClaudeProvider._fingerprint_message(msg)
-    assert fp1 == fp2
+def test_has_session_block_detects_session():
+    """Assistant message with a session block is detected."""
+    msg = _assistant_with_session("Hello")
+    assert ClaudeProvider._has_session_block(msg) is True
 
 
-def test_fingerprint_differs_for_different_content():
-    """Different content produces different fingerprints."""
-    msg1 = Message(role="assistant", content="Hello")
-    msg2 = Message(role="assistant", content="Goodbye")
-    assert ClaudeProvider._fingerprint_message(
-        msg1
-    ) != ClaudeProvider._fingerprint_message(msg2)
+def test_has_session_block_rejects_plain_assistant():
+    """Assistant message without a session block is not detected."""
+    msg = Message(role="assistant", content="Hello")
+    assert ClaudeProvider._has_session_block(msg) is False
 
 
-def test_fingerprint_differs_for_different_roles():
-    """Same content but different roles produces different fingerprints."""
-    msg1 = Message(role="user", content="Hello")
-    msg2 = Message(role="assistant", content="Hello")
-    assert ClaudeProvider._fingerprint_message(
-        msg1
-    ) != ClaudeProvider._fingerprint_message(msg2)
+def test_has_session_block_rejects_user_message():
+    """User messages are never session block carriers."""
+    msg = Message(role="user", content="Hello")
+    assert ClaudeProvider._has_session_block(msg) is False
 
 
-def test_fingerprint_handles_list_content():
-    """List content (tool call blocks) produces a stable fingerprint."""
+def test_has_session_block_rejects_redacted_thinking_without_tag():
+    """Redacted thinking without the [session]: tag is not a session block."""
+    session = Session()
+    session.data = "some other data"  # no [session]: prefix
+    msg = Message(role="assistant", content=[session])
+    assert ClaudeProvider._has_session_block(msg) is False
+
+
+def test_has_session_block_detects_among_other_blocks():
+    """Session block is found even when mixed with other content blocks."""
     msg = Message(
         role="assistant",
-        content=[ToolCallBlock(id="tc1", name="grep", input={"pattern": "test"})],
-    )
-    fp1 = ClaudeProvider._fingerprint_message(msg)
-    fp2 = ClaudeProvider._fingerprint_message(msg)
-    assert fp1 == fp2
-    assert isinstance(fp1, str)
-    assert len(fp1) == 16  # sha256 hex truncated to 16 chars
-
-
-# =============================================================================
-# _is_ephemeral_message
-# =============================================================================
-
-
-def test_ephemeral_detects_string_system_reminder():
-    """String content with <system-reminder is detected as ephemeral."""
-    msg = Message(
-        role="user",
-        content='<system-reminder source="hooks-status-context">env info</system-reminder>',
-    )
-    assert ClaudeProvider._is_ephemeral_message(msg) is True
-
-
-def test_ephemeral_detects_list_content_system_reminder():
-    """List content with <system-reminder in a text block is detected as ephemeral."""
-    msg = Message(
-        role="user",
         content=[
-            {
-                "type": "text",
-                "text": '<system-reminder source="hooks-todo">todo list</system-reminder>',
-            }
+            {"type": "thinking", "thinking": "Let me think..."},
+            ToolCallBlock(id="tc1", name="grep", input={"pattern": "test"}),
+            _make_session_block(),
         ],
     )
-    assert ClaudeProvider._is_ephemeral_message(msg) is True
-
-
-def test_ephemeral_rejects_regular_user_message():
-    """Regular user message is NOT ephemeral."""
-    msg = Message(role="user", content="Please fix the bug in auth.py")
-    assert ClaudeProvider._is_ephemeral_message(msg) is False
-
-
-def test_ephemeral_rejects_assistant_message():
-    """Assistant messages are never ephemeral."""
-    msg = Message(role="assistant", content="I'll fix that for you")
-    assert ClaudeProvider._is_ephemeral_message(msg) is False
-
-
-def test_ephemeral_rejects_tool_message():
-    """Tool result messages are never ephemeral."""
-    msg = Message(role="tool", content='{"success": true}', tool_call_id="tc1")
-    assert ClaudeProvider._is_ephemeral_message(msg) is False
-
-
-def test_ephemeral_rejects_array_without_reminder():
-    """List-content user message WITHOUT system-reminder is not ephemeral.
-
-    This is the python_check hook output case that triggered the original bug.
-    The fingerprint approach handles this through the safe fallback.
-    """
-    msg = Message(
-        role="user",
-        content=[
-            {"type": "text", "text": "Python check found issues in app.py: formatting"},
-        ],
-    )
-    assert ClaudeProvider._is_ephemeral_message(msg) is False
+    assert ClaudeProvider._has_session_block(msg) is True
 
 
 # =============================================================================
@@ -140,252 +98,6 @@ def test_first_call_returns_all_messages():
     assert result[2].role == "assistant"
 
 
-def test_first_call_stores_fingerprint():
-    """First call sets the fingerprint on the last non-ephemeral message."""
-    provider = _make_provider()
-
-    messages = [
-        Message(role="system", content="You are helpful."),
-        Message(role="user", content="Hello"),
-        Message(role="assistant", content="Hi there"),
-        Message(
-            role="user",
-            content='<system-reminder source="hooks-status-context">env</system-reminder>',
-        ),
-    ]
-    provider._get_recent_messages(messages)
-
-    # Fingerprint should be on the assistant message (last non-ephemeral)
-    expected_fp = ClaudeProvider._fingerprint_message(messages[2])
-    assert provider._session.last_delivered_fingerprint == expected_fp
-
-
-# =============================================================================
-# _get_recent_messages: resumed session (incremental delivery)
-# =============================================================================
-
-
-def test_resumed_session_sends_only_new_messages():
-    """Resumed session sends only messages after the fingerprinted anchor."""
-    provider = _make_provider()
-
-    # Simulate first call
-    first_messages = [
-        Message(role="system", content="You are helpful."),
-        Message(role="user", content="Hello"),
-        Message(role="assistant", content="Hi there"),
-        Message(
-            role="user",
-            content='<system-reminder source="hooks-status-context">env</system-reminder>',
-        ),
-    ]
-    provider._get_recent_messages(first_messages)
-
-    # Set session ID (simulating CLI response setting it)
-    provider._session.id = "test-session-123"
-
-    # Simulate second call: orchestrator removed old ephemeral, added new messages
-    second_messages = [
-        Message(role="system", content="You are helpful."),
-        Message(role="user", content="Hello"),  # old (already delivered)
-        Message(role="assistant", content="Hi there"),  # old (fingerprint anchor)
-        Message(role="tool", content='{"result": "ok"}', tool_call_id="tc1"),  # NEW
-        Message(
-            role="assistant",
-            content=[ToolCallBlock(id="tc2", name="edit_file", input={"path": "a.py"})],
-        ),  # NEW
-        Message(
-            role="user",
-            content='<system-reminder source="hooks-status-context">env v2</system-reminder>',
-        ),  # NEW ephemeral
-    ]
-    result = provider._get_recent_messages(second_messages)
-
-    # Should get: system + only new messages (after the fingerprint anchor)
-    assert len(result) == 4  # system + tool + assistant + reminder
-    assert result[0].role == "system"
-    assert result[1].role == "tool"
-    assert result[2].role == "assistant"
-    assert result[3].role == "user"
-
-
-# =============================================================================
-# _get_recent_messages: the original bug scenario
-# =============================================================================
-
-
-def test_ephemeral_array_content_does_not_inflate_index():
-    """Regression test for the d285ed4d session bug.
-
-    When iteration N has an array-content ephemeral message (like python_check
-    output) that the old _count_trailing_reminders() couldn't detect, the
-    integer index was inflated, causing iteration N+1 to skip real messages.
-
-    The fingerprint approach handles this: the python_check message is not
-    detected as ephemeral, so we fingerprint it. On the next call it's gone
-    (ephemeral), so we fall back to sending full conversation (safe).
-    """
-    provider = _make_provider()
-
-    # Iteration 4: has hook + python_check (array content, no system-reminder)
-    iter4_messages = [
-        Message(role="system", content="System prompt"),
-        Message(role="user", content="Fix the bug"),
-        Message(role="assistant", content="I'll fix it"),
-        Message(role="tool", content='{"ok": true}', tool_call_id="ef01"),
-        Message(
-            role="user",
-            content='<system-reminder source="hooks-status-context">env</system-reminder>',
-        ),
-        # python_check output - array content, NO system-reminder marker
-        Message(
-            role="user",
-            content=[
-                {
-                    "type": "text",
-                    "text": "Python check found issues in app.py: formatting",
-                }
-            ],
-        ),
-    ]
-    provider._get_recent_messages(iter4_messages)
-
-    # The python_check message is NOT detected as ephemeral, so it becomes the anchor
-    python_check_msg = iter4_messages[5]
-    expected_fp = ClaudeProvider._fingerprint_message(python_check_msg)
-    assert provider._session.last_delivered_fingerprint == expected_fp
-
-    # Set session ID
-    provider._session.id = "test-session"
-
-    # Iteration 5: orchestrator removed both ephemeral messages, added new ones
-    iter5_messages = [
-        Message(role="system", content="System prompt"),
-        Message(role="user", content="Fix the bug"),
-        Message(role="assistant", content="I'll fix it"),
-        Message(role="tool", content='{"ok": true}', tool_call_id="ef01"),
-        # NEW: assistant response with tool calls (from iteration 4)
-        Message(
-            role="assistant",
-            content=[
-                ToolCallBlock(
-                    id="rf04cla", name="read_file", input={"path": "claude.py"}
-                ),
-            ],
-        ),
-        # NEW: tool results
-        Message(role="tool", content='{"file": "contents"}', tool_call_id="rf04cla"),
-        # NEW: ephemeral reminder
-        Message(
-            role="user",
-            content='<system-reminder source="hooks-status-context">env v2</system-reminder>',
-        ),
-    ]
-    result = provider._get_recent_messages(iter5_messages)
-
-    # The python_check fingerprint is NOT in this list (it was ephemeral and removed).
-    # So we get the SAFE FALLBACK: full conversation.
-    # This means all non-system messages are included.
-    assert len(result) >= 4  # system + at minimum the new messages
-    # Critically, the new assistant and tool messages MUST be included
-    roles = [m.role for m in result]
-    assert "tool" in roles  # tool results are NOT dropped
-    assert "assistant" in roles  # assistant response is NOT dropped
-
-
-def test_normal_cycle_does_not_drop_messages():
-    """In a normal cycle (no rogue ephemeral), messages are correctly subset."""
-    provider = _make_provider()
-
-    # First call
-    messages_1 = [
-        Message(role="system", content="System prompt"),
-        Message(role="user", content="Hello"),
-        Message(role="assistant", content="Hi"),
-        Message(
-            role="user",
-            content='<system-reminder source="hooks-status-context">env</system-reminder>',
-        ),
-    ]
-    provider._get_recent_messages(messages_1)
-    provider._session.id = "sess-1"
-
-    # Second call - new tool results added after the assistant
-    messages_2 = [
-        Message(role="system", content="System prompt"),
-        Message(role="user", content="Hello"),
-        Message(role="assistant", content="Hi"),  # fingerprint anchor
-        Message(role="tool", content='{"data": 1}', tool_call_id="t1"),
-        Message(role="tool", content='{"data": 2}', tool_call_id="t2"),
-        Message(role="assistant", content="Done"),
-        Message(
-            role="user",
-            content='<system-reminder source="hooks-status-context">env</system-reminder>',
-        ),
-    ]
-    result = provider._get_recent_messages(messages_2)
-
-    # Should only include system + new messages after the anchor
-    assert result[0].role == "system"
-    assert result[0].content == "System prompt"
-    # New messages: tool, tool, assistant, reminder
-    new_msgs = result[1:]
-    assert len(new_msgs) == 4
-    assert new_msgs[0].role == "tool"
-    assert new_msgs[1].role == "tool"
-    assert new_msgs[2].role == "assistant"
-    assert new_msgs[3].role == "user"
-
-
-# =============================================================================
-# _get_recent_messages: compaction fallback
-# =============================================================================
-
-
-def test_compaction_triggers_safe_fallback():
-    """When the fingerprinted message is removed by compaction, send everything."""
-    provider = _make_provider()
-
-    # First call establishes fingerprint on the assistant message
-    messages_1 = [
-        Message(role="system", content="System prompt"),
-        Message(role="user", content="Hello"),
-        Message(role="assistant", content="I will do the thing"),
-        Message(
-            role="user",
-            content='<system-reminder source="hooks-status-context">env</system-reminder>',
-        ),
-    ]
-    provider._get_recent_messages(messages_1)
-    provider._session.id = "sess-1"
-
-    # Second call - compaction removed the original user + assistant
-    messages_2 = [
-        Message(role="system", content="System prompt"),
-        # compaction notice replaces old messages
-        Message(role="user", content="[Earlier conversation was compacted]"),
-        Message(role="assistant", content="Continuing from compacted context"),
-        Message(role="tool", content='{"ok": true}', tool_call_id="t1"),
-        Message(
-            role="user",
-            content='<system-reminder source="hooks-status-context">env</system-reminder>',
-        ),
-    ]
-    result = provider._get_recent_messages(messages_2)
-
-    # Fingerprint "I will do the thing" is gone. Fallback: send ALL conversation.
-    assert len(result) == 5  # system + all 4 conversation messages
-    assert result[0].role == "system"
-    # All conversation messages are present (nothing dropped)
-    assert result[1].content == "[Earlier conversation was compacted]"
-    assert result[3].role == "tool"
-
-
-# =============================================================================
-# _get_recent_messages: no system prefix
-# =============================================================================
-
-
 def test_no_system_prefix_returns_all():
     """Messages without a system prefix are returned unchanged."""
     provider = _make_provider()
@@ -398,24 +110,288 @@ def test_no_system_prefix_returns_all():
 
 
 # =============================================================================
-# _get_recent_messages: only ephemeral conversation
+# _get_recent_messages: resumed session (incremental delivery)
 # =============================================================================
 
 
-def test_all_ephemeral_does_not_update_fingerprint():
-    """If all conversation messages are ephemeral, fingerprint stays unchanged."""
+def test_resumed_session_sends_only_new_messages():
+    """Resumed session sends only messages after the session-block anchor."""
     provider = _make_provider()
-    provider._session.id = "sess-1"
-    provider._session.last_delivered_fingerprint = "old_fingerprint"
+    provider._session.id = "test-session"
+
+    messages = [
+        Message(role="system", content="You are helpful."),
+        Message(role="user", content="Hello"),
+        _assistant_with_session("Hi there"),  # anchor
+        Message(role="user", content="Do something"),  # NEW
+        Message(
+            role="user",
+            content='<system-reminder source="hooks-status-context">env</system-reminder>',
+        ),  # NEW
+    ]
+    result = provider._get_recent_messages(messages)
+
+    # Should get: system + only new messages after the anchor
+    assert len(result) == 3  # system + user + reminder
+    assert result[0].role == "system"
+    assert result[1].content == "Do something"
+    assert "<system-reminder" in result[2].content
+
+
+def test_resumed_session_with_tool_results():
+    """Tool results after the session block are delivered."""
+    provider = _make_provider()
+    provider._session.id = "test-session"
 
     messages = [
         Message(role="system", content="System prompt"),
+        Message(role="user", content="Fix the bug"),
+        _assistant_with_session(),  # anchor - assistant with tool_use + session block
+        # Tool results from the assistant's tool calls:
+        Message(
+            role="user",
+            content=[ToolResultBlock(tool_call_id="tc1", output='{"ok": true}')],
+        ),
+        Message(
+            role="user",
+            content=[ToolResultBlock(tool_call_id="tc2", output='{"ok": true}')],
+        ),
         Message(
             role="user",
             content='<system-reminder source="hooks-status-context">env</system-reminder>',
         ),
     ]
-    provider._get_recent_messages(messages)
+    result = provider._get_recent_messages(messages)
 
-    # Fingerprint should remain unchanged (no non-ephemeral to anchor on)
-    assert provider._session.last_delivered_fingerprint == "old_fingerprint"
+    # system + 2 tool results + reminder
+    assert len(result) == 4
+    assert result[0].role == "system"
+    assert result[1].content[0].type == "tool_result"
+    assert result[2].content[0].type == "tool_result"
+    assert "<system-reminder" in result[3].content
+
+
+def test_resumed_session_with_hook_outputs():
+    """Hook outputs (like python_check) after session block are delivered.
+
+    This is the scenario that broke the fingerprint approach: python_check
+    outputs change between turns, causing fingerprint mismatch and full
+    conversation resend. The session-block anchor is immune to this because
+    it doesn't depend on message content.
+    """
+    provider = _make_provider()
+    provider._session.id = "test-session"
+
+    messages = [
+        Message(role="system", content="System prompt"),
+        Message(role="user", content="Fix the bug"),
+        _assistant_with_session(),  # anchor
+        Message(
+            role="user",
+            content=[ToolResultBlock(tool_call_id="tc1", output='{"ok": true}')],
+        ),
+        # python_check hook output -- changes between turns
+        Message(
+            role="user",
+            content="Python check found issues in app.py: formatting",
+        ),
+        Message(
+            role="user",
+            content='<system-reminder source="hooks-status-context">env</system-reminder>',
+        ),
+    ]
+    result = provider._get_recent_messages(messages)
+
+    # system + tool_result + hook output + reminder
+    assert len(result) == 4
+    assert result[0].role == "system"
+    assert result[2].content == "Python check found issues in app.py: formatting"
+
+
+def test_multiple_session_blocks_uses_most_recent():
+    """When multiple session blocks exist, the most recent one is the anchor."""
+    provider = _make_provider()
+    provider._session.id = "test-session"
+
+    messages = [
+        Message(role="system", content="System prompt"),
+        Message(role="user", content="Hello"),
+        _assistant_with_session("First response", session_id="sess-1"),  # older
+        Message(
+            role="user",
+            content=[ToolResultBlock(tool_call_id="tc1", output="done")],
+        ),
+        _assistant_with_session("Second response", session_id="sess-2"),  # newer anchor
+        Message(role="user", content="Continue"),  # NEW
+        Message(
+            role="user",
+            content='<system-reminder source="hooks-status-context">env</system-reminder>',
+        ),  # NEW
+    ]
+    result = provider._get_recent_messages(messages)
+
+    # system + only messages after the SECOND session block
+    assert len(result) == 3  # system + user + reminder
+    assert result[0].role == "system"
+    assert result[1].content == "Continue"
+
+
+# =============================================================================
+# _get_recent_messages: edge cases
+# =============================================================================
+
+
+def test_nothing_new_after_session_block():
+    """If the session block is the last message, only system messages returned."""
+    provider = _make_provider()
+    provider._session.id = "test-session"
+
+    messages = [
+        Message(role="system", content="System prompt"),
+        Message(role="user", content="Hello"),
+        _assistant_with_session("Done"),
+    ]
+    result = provider._get_recent_messages(messages)
+
+    assert len(result) == 1  # just system
+    assert result[0].role == "system"
+
+
+def test_no_session_block_in_resumed_session_sends_all():
+    """If session ID is set but no session block found, send full conversation.
+
+    This handles the edge case where the session was somehow established
+    without a session block in the conversation history.
+    """
+    provider = _make_provider()
+    provider._session.id = "test-session"
+
+    messages = [
+        Message(role="system", content="System prompt"),
+        Message(role="user", content="Hello"),
+        Message(role="assistant", content="Hi"),  # no session block
+        Message(role="user", content="Continue"),
+    ]
+    result = provider._get_recent_messages(messages)
+
+    # No anchor found -- send full conversation (first-call behavior)
+    assert len(result) == 4
+
+
+def test_session_block_with_mixed_content_types():
+    """Session block detection works with various assistant content types."""
+    provider = _make_provider()
+    provider._session.id = "test-session"
+
+    # Assistant message with thinking + tool_use + session block
+    messages = [
+        Message(role="system", content="System prompt"),
+        Message(
+            role="assistant",
+            content=[
+                {"type": "thinking", "thinking": "Let me analyze..."},
+                ToolCallBlock(id="ed01", name="edit_file", input={"path": "a.py"}),
+                ToolCallBlock(
+                    id="pc01", name="python_check", input={"paths": ["a.py"]}
+                ),
+                _make_session_block(),
+            ],
+        ),
+        # New messages after the anchor
+        Message(
+            role="user",
+            content=[
+                ToolResultBlock(tool_call_id="ed01", output="ok"),
+                ToolResultBlock(tool_call_id="pc01", output="ok"),
+            ],
+        ),
+        Message(
+            role="user",
+            content='<system-reminder source="hooks-status-context">env</system-reminder>',
+        ),
+        Message(
+            role="user",
+            content="Python check found issues in app.py: line 42",
+        ),
+    ]
+    result = provider._get_recent_messages(messages)
+
+    # system + tool_results + reminder + hook output
+    assert len(result) == 4
+    assert result[0].role == "system"
+    assert result[1].content[0].type == "tool_result"
+
+
+def test_python_check_change_between_turns_no_resend():
+    """Regression test: python_check output changing between turns must NOT
+    cause full conversation resend.
+
+    This was the root cause of the 'Prompt is too long' bug. The fingerprint
+    approach anchored on python_check output, which changed between turns,
+    triggering a full-conversation fallback that exploded CLI context.
+
+    The session-block anchor is immune because it anchors on structure,
+    not content.
+    """
+    provider = _make_provider()
+    provider._session.id = "test-session"
+
+    # Turn N: assistant responded, python_check output present
+    messages_turn_n = [
+        Message(role="system", content="System prompt"),
+        Message(role="user", content="Fix the bug"),
+        _assistant_with_session("I'll fix it"),
+        Message(
+            role="user",
+            content=[ToolResultBlock(tool_call_id="ef01", output='{"ok": true}')],
+        ),
+        Message(
+            role="user",
+            content="Python check found issues: line 10 formatting",
+        ),
+        Message(
+            role="user",
+            content='<system-reminder source="hooks-status-context">env v1</system-reminder>',
+        ),
+    ]
+    result_n = provider._get_recent_messages(messages_turn_n)
+    # Should be system + 3 new messages
+    assert len(result_n) == 4
+
+    # Turn N+1: python_check output CHANGED (code was edited), new messages added
+    messages_turn_n1 = [
+        Message(role="system", content="System prompt"),
+        Message(role="user", content="Fix the bug"),
+        _assistant_with_session("I'll fix it"),  # old anchor
+        Message(
+            role="user",
+            content=[ToolResultBlock(tool_call_id="ef01", output='{"ok": true}')],
+        ),
+        # python_check output CHANGED -- this broke the fingerprint approach
+        Message(
+            role="user",
+            content="Python check found DIFFERENT issues: line 20 types",
+        ),
+        # New assistant response with session block
+        _assistant_with_session(
+            "Applied fix", session_id="test-session-2"
+        ),  # NEW anchor
+        # New tool results
+        Message(
+            role="user",
+            content=[ToolResultBlock(tool_call_id="ef02", output='{"ok": true}')],
+        ),
+        Message(
+            role="user",
+            content='<system-reminder source="hooks-status-context">env v2</system-reminder>',
+        ),
+    ]
+    result_n1 = provider._get_recent_messages(messages_turn_n1)
+
+    # Session-block anchor finds the NEWER "Applied fix" assistant message.
+    # Only sends messages after it: tool_result + reminder.
+    # NOT the full conversation (which would be 7 messages).
+    assert len(result_n1) == 3  # system + tool_result + reminder
+    assert result_n1[0].role == "system"
+    assert result_n1[1].content[0].type == "tool_result"
+    assert result_n1[1].content[0].tool_call_id == "ef02"
