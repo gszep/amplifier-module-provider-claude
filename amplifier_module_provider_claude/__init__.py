@@ -206,7 +206,7 @@ class ClaudeProvider:
         self.raw_debug: bool = self.config.get("raw_debug", False)
         self.debug_truncate_length: int = self.config.get("debug_truncate_length", 180)
 
-        self.timeout: float = self.config.get("timeout", 120.0)
+        self.timeout: float = self.config.get("timeout", 600.0)
         self.use_streaming = True  # sdk only supports streaming
         self.enable_web_search: bool = self.config.get("enable_web_search", False)
 
