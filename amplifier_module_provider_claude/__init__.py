@@ -206,7 +206,7 @@ class ClaudeProvider:
         self.raw_debug: bool = self.config.get("raw_debug", False)
         self.debug_truncate_length: int = self.config.get("debug_truncate_length", 180)
 
-        self.timeout: float = self.config.get("timeout", 900.0)
+        self.timeout: float = self.config.get("timeout", 120.0)
         self.use_streaming = True  # sdk only supports streaming
         self.enable_web_search: bool = self.config.get("enable_web_search", False)
 
@@ -764,98 +764,41 @@ class ClaudeProvider:
                 )
 
         start_time = time.time()
+        _client_ref: ClaudeSDKClient | None = None
 
-        async with asyncio.timeout(self.timeout):
-            async with ClaudeSDKClient(
-                options=ClaudeAgentOptions(
-                    tools=[],  # disable built-in tools
-                    model=self.default_model,
-                    resume=self._session.id,
-                    system_prompt="---",  # system prompt is passed in messages
-                    max_thinking_tokens=self.max_thinking_tokens,
-                    betas=self._beta_headers,
-                )
-            ) as client:
-                prompt = self._convert_prompt_from_request_params(params)
-                await client.query(prompt, session_id=self._session.id)
-                response = await self._parse_response(client)
-
-                # Signal CLI that input is complete and wait for graceful exit
-                # so it can flush the full response to its session file before
-                # the context manager tears down the subprocess with SIGTERM.
-                try:
-                    transport = client._transport
-                    await transport.end_input()
-                    if hasattr(transport, "_process") and transport._process:
-                        await asyncio.wait_for(transport._process.wait(), timeout=5.0)
-                except (asyncio.TimeoutError, Exception):
-                    pass
-
-        # If we get here, request succeeded - continue with response handling
         try:
-            elapsed_ms = int((time.time() - start_time) * 1000)
-
-            logger.info("[PROVIDER] Received response from Anthropic API")
-            logger.debug(f"[PROVIDER] Response type: {response.model}")
-
-            # Emit llm:response event
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
-                # INFO level: Summary with rate limit info
-                response_event: dict[str, Any] = {
-                    "provider": "anthropic",
-                    "model": params["model"],
-                    "usage": {
-                        "input": response.usage.input_tokens,
-                        "output": response.usage.output_tokens,
-                        **(
-                            {"cache_read": response.usage.cache_read_input_tokens}
-                            if hasattr(response.usage, "cache_read_input_tokens")
-                            and response.usage.cache_read_input_tokens
-                            else {}
-                        ),
-                        **(
-                            {"cache_write": response.usage.cache_creation_input_tokens}
-                            if hasattr(response.usage, "cache_creation_input_tokens")
-                            and response.usage.cache_creation_input_tokens
-                            else {}
-                        ),
-                    },
-                    "status": "ok",
-                    "duration_ms": elapsed_ms,
-                }
-
-                await self.coordinator.hooks.emit("llm:response", response_event)
-
-                # DEBUG level: Full response with truncated values (if debug enabled)
-                if self.debug:
-                    response_dict = response.model_dump()  # Pydantic model → dict
-                    await self.coordinator.hooks.emit(
-                        "llm:response:debug",
-                        {
-                            "lvl": "DEBUG",
-                            "provider": "anthropic",
-                            "response": self._truncate_values(response_dict),
-                            "status": "ok",
-                            "duration_ms": elapsed_ms,
-                        },
+            async with asyncio.timeout(self.timeout):
+                async with ClaudeSDKClient(
+                    options=ClaudeAgentOptions(
+                        tools=[],  # disable built-in tools
+                        model=self.default_model,
+                        resume=self._session.id,
+                        system_prompt="---",  # system prompt is passed in messages
+                        max_thinking_tokens=self.max_thinking_tokens,
+                        betas=self._beta_headers,
                     )
+                ) as client:
+                    _client_ref = client
+                    prompt = self._convert_prompt_from_request_params(params)
+                    await client.query(prompt, session_id=self._session.id)
+                    response = await self._parse_response(client)
 
-                # RAW level: Complete response object from Anthropic API (if debug AND raw_debug enabled)
-                if self.debug and self.raw_debug:
-                    await self.coordinator.hooks.emit(
-                        "llm:response:raw",
-                        {
-                            "lvl": "DEBUG",
-                            "provider": "anthropic",
-                            "response": response.model_dump(),  # Complete untruncated response
-                        },
-                    )
-
-            # Convert to ChatResponse
-            return self._convert_to_chat_response(response)
+                    # Signal CLI that input is complete and wait for graceful exit
+                    # so it can flush the full response to its session file before
+                    # the context manager tears down the subprocess with SIGTERM.
+                    try:
+                        transport = client._transport
+                        await transport.end_input()
+                        if hasattr(transport, "_process") and transport._process:
+                            await asyncio.wait_for(
+                                transport._process.wait(), timeout=5.0
+                            )
+                    except (asyncio.TimeoutError, Exception):
+                        pass
 
         except TimeoutError:
-            # Handle timeout specifically - TimeoutError has empty str() representation
+            # Forcefully kill CLI subprocess to prevent zombie processes
+            self._force_kill_subprocess(_client_ref)
             elapsed_ms = int((time.time() - start_time) * 1000)
             error_msg = f"Request timed out after {self.timeout}s"
             logger.error(f"[PROVIDER] Anthropic API error: {error_msg}")
@@ -874,7 +817,15 @@ class ClaudeProvider:
                 )
             raise TimeoutError(error_msg) from None
 
+        except asyncio.CancelledError:
+            # Ctrl+C or parent task cancellation - forcefully kill the subprocess
+            self._force_kill_subprocess(_client_ref)
+            logger.warning("[PROVIDER] Request cancelled - CLI subprocess killed")
+            raise
+
         except Exception as e:
+            # Kill CLI subprocess on any error
+            self._force_kill_subprocess(_client_ref)
             elapsed_ms = int((time.time() - start_time) * 1000)
             # Ensure error message is never empty
             error_msg = str(e) or f"{type(e).__name__}: (no message)"
@@ -896,6 +847,88 @@ class ClaudeProvider:
             if not str(e):
                 raise type(e)(error_msg) from e
             raise
+
+        # If we get here, request succeeded - continue with response handling
+        elapsed_ms = int((time.time() - start_time) * 1000)
+
+        logger.info("[PROVIDER] Received response from Anthropic API")
+        logger.debug(f"[PROVIDER] Response type: {response.model}")
+
+        # Emit llm:response event
+        if self.coordinator and hasattr(self.coordinator, "hooks"):
+            # INFO level: Summary with rate limit info
+            response_event: dict[str, Any] = {
+                "provider": "anthropic",
+                "model": params["model"],
+                "usage": {
+                    "input": response.usage.input_tokens,
+                    "output": response.usage.output_tokens,
+                    **(
+                        {"cache_read": response.usage.cache_read_input_tokens}
+                        if hasattr(response.usage, "cache_read_input_tokens")
+                        and response.usage.cache_read_input_tokens
+                        else {}
+                    ),
+                    **(
+                        {"cache_write": response.usage.cache_creation_input_tokens}
+                        if hasattr(response.usage, "cache_creation_input_tokens")
+                        and response.usage.cache_creation_input_tokens
+                        else {}
+                    ),
+                },
+                "status": "ok",
+                "duration_ms": elapsed_ms,
+            }
+
+            await self.coordinator.hooks.emit("llm:response", response_event)
+
+            # DEBUG level: Full response with truncated values (if debug enabled)
+            if self.debug:
+                response_dict = response.model_dump()  # Pydantic model → dict
+                await self.coordinator.hooks.emit(
+                    "llm:response:debug",
+                    {
+                        "lvl": "DEBUG",
+                        "provider": "anthropic",
+                        "response": self._truncate_values(response_dict),
+                        "status": "ok",
+                        "duration_ms": elapsed_ms,
+                    },
+                )
+
+            # RAW level: Complete response object from Anthropic API (if debug AND raw_debug enabled)
+            if self.debug and self.raw_debug:
+                await self.coordinator.hooks.emit(
+                    "llm:response:raw",
+                    {
+                        "lvl": "DEBUG",
+                        "provider": "anthropic",
+                        "response": response.model_dump(),  # Complete untruncated response
+                    },
+                )
+
+        # Convert to ChatResponse
+        return self._convert_to_chat_response(response)
+
+    def _force_kill_subprocess(self, client: "ClaudeSDKClient | None") -> None:
+        """Forcefully kill the CLI subprocess to prevent zombie processes.
+
+        Called on timeout, cancellation, or errors to ensure the subprocess
+        doesn't outlive the provider request.
+        """
+        if client is None:
+            return
+        try:
+            transport = client._transport
+            if hasattr(transport, "_process") and transport._process:
+                if transport._process.returncode is None:
+                    logger.warning(
+                        "[PROVIDER] Force-killing CLI subprocess (PID: %s)",
+                        transport._process.pid,
+                    )
+                    transport._process.kill()
+        except Exception as exc:
+            logger.debug(f"[PROVIDER] Error killing subprocess: {exc}")
 
     def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
         """Parse tool calls from response.
@@ -1720,6 +1753,7 @@ class ClaudeProvider:
         model: str = ""
         content: list[ParsedContentBlock] = []
         usage = AnthropicUsage(input_tokens=0, output_tokens=0)
+        received_result = False
 
         async for message in client.receive_response():
             match message:
@@ -1758,6 +1792,7 @@ class ClaudeProvider:
                                 )
 
                 case claude_agent_sdk.types.ResultMessage():
+                    received_result = True
                     self._session.id = (
                         message.session_id
                     )  # update session - enables resume
@@ -1797,6 +1832,12 @@ class ClaudeProvider:
                     raise NotImplementedError(
                         f"[PROVIDER] Unknown message type from SDK: {type(message)}"
                     )
+
+        if not received_result:
+            raise RuntimeError(
+                "[PROVIDER] CLI subprocess ended without delivering a ResultMessage. "
+                "The subprocess may have crashed or its stdout pipe was blocked."
+            )
 
         stop_reason = (
             "tool_use"
